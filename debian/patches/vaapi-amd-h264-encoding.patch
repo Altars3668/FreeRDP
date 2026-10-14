@@ -1,0 +1,107 @@
+Index: freerdp3-3.24.2+dfsg/libfreerdp/codec/h264.c
+===================================================================
+--- freerdp3-3.24.2+dfsg.orig/libfreerdp/codec/h264.c
++++ freerdp3-3.24.2+dfsg/libfreerdp/codec/h264.c
+@@ -54,7 +54,11 @@ static BOOL yuv_ensure_buffer(H264_CONTE
+ 	if (pheight % 16 != 0)
+ 		pheight += 16 - pheight % 16;
+ 
+-	const size_t nPlanes = h264->hwAccel ? 2 : 3;
++	/* Always allocate 3 I420 planes. The hwAccel encode path (VAAPI) does
++	 * RGB->YUV420P via yuv420_context_encode() which writes all 3 planes.
++	 * For hwAccel decode, the pointers/strides are overwritten by the
++	 * decoder output anyway, so extra allocation is harmless. */
++	const size_t nPlanes = 3;
+ 
+ 	for (size_t x = 0; x < nPlanes; x++)
+ 	{
+@@ -70,18 +74,9 @@ static BOOL yuv_ensure_buffer(H264_CONTE
+ 	if (isNull || (width != h264->width) || (height != h264->height) ||
+ 	    (stride != h264->iStride[0]))
+ 	{
+-		if (h264->hwAccel) /* NV12 */
+-		{
+-			h264->iStride[0] = stride;
+-			h264->iStride[1] = stride;
+-			h264->iStride[2] = 0;
+-		}
+-		else /* I420 */
+-		{
+-			h264->iStride[0] = stride;
+-			h264->iStride[1] = (stride + 1) / 2;
+-			h264->iStride[2] = (stride + 1) / 2;
+-		}
++		h264->iStride[0] = stride;
++		h264->iStride[1] = (stride + 1) / 2;
++		h264->iStride[2] = (stride + 1) / 2;
+ 
+ 		for (size_t x = 0; x < nPlanes; x++)
+ 		{
+@@ -725,6 +720,12 @@ static BOOL h264_context_init(H264_CONTE
+ 		if (!subsystem || !subsystem->Init)
+ 			break;
+ 
++		/* When hw accel is requested, skip pure-software subsystems
++		 * so that FFmpeg/VAAPI gets a chance to initialize */
++		if (h264->Compressor && h264->hwAccel &&
++		    strcmp(subsystem->name, "OpenH264") == 0)
++			continue;
++
+ 		if (subsystem->Init(h264))
+ 		{
+ 			h264->subsystem = subsystem;
+Index: freerdp3-3.24.2+dfsg/libfreerdp/codec/h264_ffmpeg.c
+===================================================================
+--- freerdp3-3.24.2+dfsg.orig/libfreerdp/codec/h264_ffmpeg.c
++++ freerdp3-3.24.2+dfsg/libfreerdp/codec/h264_ffmpeg.c
+@@ -218,9 +218,10 @@ static BOOL libavcodec_create_encoder_co
+ #ifdef WITH_VAAPI_H264_ENCODING
+ 	if (sys->hwctx)
+ 	{
+-		av_opt_set(sys->codecEncoderContext, "preset", "veryslow", AV_OPT_SEARCH_CHILDREN);
+-
+ 		sys->codecEncoderContext->pix_fmt = AV_PIX_FMT_VAAPI;
++		sys->codecEncoderContext->max_b_frames = 0;
++		sys->codecEncoderContext->gop_size = WINPR_ASSERTING_INT_CAST(int, h264->FrameRate);
++		av_opt_set_int(sys->codecEncoderContext->priv_data, "async_depth", 1, 0);
+ 		/* set hw_frames_ctx for encoder's AVCodecContext */
+ 		if (set_hw_frames_ctx(h264) < 0)
+ 			goto EXCEPTION;
+@@ -451,7 +452,7 @@ static int libavcodec_compress(H264_CONT
+ 			           av_err2str(status), status);
+ 			goto fail;
+ 		}
+-		sys->videoFrame->format = AV_PIX_FMT_NV12;
++		/* Keep YUV420P format - av_hwframe_transfer_data will convert to NV12 during upload */
+ 		if ((status = av_hwframe_transfer_data(sys->hwVideoFrame, sys->videoFrame, 0)) < 0)
+ 		{
+ 			WLog_Print(h264->log, WLOG_ERROR, "av_hwframe_transfer_data failed (%s [%d])",
+@@ -472,16 +473,25 @@ static int libavcodec_compress(H264_CONT
+ 
+ 	if (status < 0)
+ 	{
+-		WLog_Print(h264->log, WLOG_ERROR, "Failed to encode video frame (%s [%d])",
++		WLog_Print(h264->log, WLOG_ERROR, "avcodec_send_frame failed (%s [%d])",
+ 		           av_err2str(status), status);
+ 		goto fail;
+ 	}
+ 
+ 	status = avcodec_receive_packet(sys->codecEncoderContext, sys->packet);
+ 
+-	if (status < 0)
++	if (status == AVERROR(EAGAIN))
++	{
++		/* Encoder needs more input before producing output (codec latency) */
++		WLog_Print(h264->log, WLOG_DEBUG, "avcodec_receive_packet: EAGAIN (need more input)");
++		*ppDstData = NULL;
++		*pDstSize = 0;
++		rc = 0;
++		goto fail;
++	}
++	else if (status < 0)
+ 	{
+-		WLog_Print(h264->log, WLOG_ERROR, "Failed to encode video frame (%s [%d])",
++		WLog_Print(h264->log, WLOG_ERROR, "avcodec_receive_packet failed (%s [%d])",
+ 		           av_err2str(status), status);
+ 		goto fail;
+ 	}

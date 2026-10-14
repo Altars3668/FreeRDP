@@ -1,0 +1,4 @@
+lp2161573.patch
+vaapi-amd-h264-encoding.patch
+rdpeudp-server-transport.patch
+rdpgfx-hevc.patch

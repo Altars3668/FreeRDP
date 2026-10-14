@@ -1,0 +1,616 @@
+Index: freerdp3-3.30.0+dfsg/channels/rdpgfx/client/rdpgfx_codec.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/channels/rdpgfx/client/rdpgfx_codec.c
++++ freerdp3-3.30.0+dfsg/channels/rdpgfx/client/rdpgfx_codec.c
+@@ -155,6 +155,66 @@ static UINT rdpgfx_decode_AVC420(RDPGFX_
+ 	return error;
+ }
+ 
++#if defined(WITH_GFX_AZURE)
++/**
++ * An HEVC surface command carries the AVC420 metablock, then a table of NAL unit
++ * lengths, then the bitstream. The table is what the Microsoft client needs to
++ * hand its Media Foundation decoder as MF_NALU_LENGTH_INFORMATION; nothing here
++ * needs it, since the bitstream is self-delimiting, so it is read past.
++ */
++static UINT rdpgfx_decode_HEVC(RDPGFX_PLUGIN* gfx, RDPGFX_SURFACE_COMMAND* cmd)
++{
++	RDPGFX_AVC420_BITMAP_STREAM hevc = WINPR_C_ARRAY_INIT;
++	UINT32 cbNaluLengths = 0;
++	wStream* s = Stream_New(cmd->data, cmd->length);
++	UINT error = CHANNEL_RC_OK;
++
++	if (!s)
++	{
++		WLog_Print(gfx->base.log, WLOG_ERROR, "Stream_New failed!");
++		return CHANNEL_RC_NO_MEMORY;
++	}
++
++	error = rdpgfx_read_h264_metablock(gfx, s, &(hevc.meta));
++	if (error != CHANNEL_RC_OK)
++	{
++		Stream_Free(s, FALSE);
++		WLog_Print(gfx->base.log, WLOG_ERROR,
++		           "rdpgfx_read_h264_metablock failed with error %" PRIu32 "!", error);
++		return error;
++	}
++
++	if (!Stream_CheckAndLogRequiredLengthWLog(gfx->base.log, s, 4))
++	{
++		Stream_Free(s, FALSE);
++		free_h264_metablock(&hevc.meta);
++		return ERROR_INVALID_DATA;
++	}
++
++	Stream_Read_UINT32(s, cbNaluLengths); /* cbNaluLengths (4 bytes) */
++
++	if (!Stream_CheckAndLogRequiredLengthWLog(gfx->base.log, s, cbNaluLengths))
++	{
++		Stream_Free(s, FALSE);
++		free_h264_metablock(&hevc.meta);
++		return ERROR_INVALID_DATA;
++	}
++
++	Stream_Seek(s, cbNaluLengths); /* naluLengths (cbNaluLengths bytes) */
++
++	hevc.data = Stream_Pointer(s);
++	hevc.length = (UINT32)Stream_GetRemainingLength(s);
++	Stream_Free(s, FALSE);
++	cmd->extra = (void*)&hevc;
++
++	error = logSurfaceCommand(gfx, cmd);
++
++	free_h264_metablock(&hevc.meta);
++	cmd->extra = nullptr;
++	return error;
++}
++#endif
++
+ /**
+  * Function description
+  *
+@@ -274,6 +334,15 @@ UINT rdpgfx_decode(RDPGFX_PLUGIN* gfx, R
+ 
+ 			break;
+ 
++#if defined(WITH_GFX_AZURE)
++		case RDPGFX_CODECID_HEVC:
++			if ((error = rdpgfx_decode_HEVC(gfx, cmd)))
++				WLog_Print(gfx->base.log, WLOG_ERROR,
++				           "rdpgfx_decode_HEVC failed with error %" PRIu32 "", error);
++
++			break;
++#endif
++
+ 		case RDPGFX_CODECID_AVC444:
+ 		case RDPGFX_CODECID_AVC444v2:
+ 			if ((error = rdpgfx_decode_AVC444(gfx, cmd)))
+Index: freerdp3-3.30.0+dfsg/channels/rdpgfx/client/rdpgfx_main.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/channels/rdpgfx/client/rdpgfx_main.c
++++ freerdp3-3.30.0+dfsg/channels/rdpgfx/client/rdpgfx_main.c
+@@ -525,6 +525,11 @@ static UINT rdpgfx_send_supported_caps(G
+ 			capsSet->version = RDPGFX_CAPVERSION_113;
+ 			capsSet->length = 0x4;
+ 			capsSet->flags = caps10Flags;
++#if defined(WITH_GFX_AZURE)
++			/* Only 0x000B0200 and 0x000B0300 carry this bit; see the note on
++			 * RDPGFX_CAPS_FLAG_HEVC in rdpgfx.h. */
++			capsSet->flags |= RDPGFX_CAPS_FLAG_HEVC;
++#endif
+ #if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
+ 			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
+ #endif
+@@ -1509,6 +1514,9 @@ static BOOL checkSurfaceCommand(const RD
+ 		case RDPGFX_CODECID_AVC444v2:
+ 		case RDPGFX_CODECID_CAPROGRESSIVE:
+ 		case RDPGFX_CODECID_CAPROGRESSIVE_V2:
++#if defined(WITH_GFX_AZURE)
++		case RDPGFX_CODECID_HEVC:
++#endif
+ 			return TRUE;
+ #if defined(WITH_GFX_AV1)
+ 		case RDPGFX_CODECID_AV1:
+Index: freerdp3-3.30.0+dfsg/channels/rdpgfx/server/rdpgfx_main.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/channels/rdpgfx/server/rdpgfx_main.c
++++ freerdp3-3.30.0+dfsg/channels/rdpgfx/server/rdpgfx_main.c
+@@ -41,6 +41,10 @@
+ 
+ #define TAG CHANNELS_TAG("rdpgfx.server")
+ 
++/* An access unit here is a handful of NAL units; the cap only bounds the
++ * scratch array the lengths are gathered into. */
++#define RDPGFX_HEVC_MAX_NALUS 256
++
+ static BOOL rdpgfx_server_close(RdpgfxServerContext* context);
+ 
+ #define checkCapsAreExchanged(context) \
+@@ -189,6 +193,7 @@ out:
+  * @return new stream
+  */
+ WINPR_ATTR_MALLOC(Stream_Free, 1)
++
+ static wStream* rdpgfx_server_single_packet_new(wLog* log, UINT16 cmdId, size_t dataLen)
+ {
+ 	UINT error = 0;
+@@ -255,9 +260,20 @@ rdpgfx_send_caps_confirm_pdu(RdpgfxServe
+ 		return CHANNEL_RC_NO_MEMORY;
+ 	}
+ 
+-	WLog_Print(context->priv->log, WLOG_DEBUG,
+-	           "CAPS version=0x%04" PRIx32 ", flags=0x%04" PRIx32 ", length=%" PRIu32,
+-	           capsSet->version, capsSet->flags, capsSet->length);
++	/* At INFO, beside the advertise it answers: which version and which codecs a
++	 * session ended up with is the first thing wanted when a client shows a black
++	 * screen or falls back to a slow codec, and at DEBUG it is invisible unless
++	 * the whole channel is turned up. */
++	WLog_Print(context->priv->log, WLOG_INFO,
++	           "CapsConfirm: version 0x%08" PRIX32 " length %" PRIu32 " flags 0x%08" PRIX32 "%s%s",
++	           capsSet->version, capsSet->length, capsSet->flags,
++	           (capsSet->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) ? " AVC_DISABLED" : " AVC",
++#if defined(WITH_GFX_AZURE)
++	           (capsSet->flags & RDPGFX_CAPS_FLAG_HEVC) ? " HEVC" : ""
++#else
++	           ""
++#endif
++	);
+ 	Stream_Write_UINT32(s, capsSet->version); /* version (4 bytes) */
+ 	Stream_Write_UINT32(s, capsSet->length);  /* capsDataLength (4 bytes) */
+ 
+@@ -601,6 +617,15 @@ rdpgfx_estimate_surface_command(const RD
+ 			h264Size = rdpgfx_estimate_h264_avc420(havc420);
+ 			return RDPGFX_WIRE_TO_SURFACE_PDU_1_SIZE + h264Size;
+ 
++#if defined(WITH_GFX_AZURE)
++		case RDPGFX_CODECID_HEVC:
++			havc420 = (RDPGFX_AVC420_BITMAP_STREAM*)cmd->extra;
++			h264Size = rdpgfx_estimate_h264_avc420(havc420);
++			/* and the NALU length table between the metablock and the stream */
++			h264Size += 4 + 4 * RDPGFX_HEVC_MAX_NALUS;
++			return RDPGFX_WIRE_TO_SURFACE_PDU_1_SIZE + h264Size;
++#endif
++
+ 		case RDPGFX_CODECID_AVC444:
+ 			havc444 = (RDPGFX_AVC444_BITMAP_STREAM*)cmd->extra;
+ 			h264Size = sizeof(UINT32); /* cbAvc420EncodedBitstream1 */
+@@ -648,6 +673,88 @@ rdpgfx_surface_command_cmdid(const RDPGF
+  *
+  * @return 0 on success, otherwise a Win32 error code
+  */
++/*
++ * The NALU length table an HEVC surface command carries between the metablock
++ * and the bitstream.
++ *
++ * mstscax.dll's HevcDecoder::DecodeHeader is handed the whole of bitmapData and
++ * walks it in one pass: numRegionRects, the rectangles and quality values, then
++ * a byte count here, then that many bytes of UINT32 lengths -- they become the
++ * MF_NALU_LENGTH_INFORMATION blob its Media Foundation decoder wants. Without
++ * the table it reads the first four bytes of the bitstream as the count,
++ * decides 0x01000000 is longer than what is left, and refuses the frame.
++ *
++ * One length per NAL unit, each counting its start code prefix, so that the
++ * lengths sum to the bitstream.
++ */
++static UINT32 rdpgfx_hevc_nalu_offsets(const BYTE* data, UINT32 length, UINT32* offsets)
++{
++	UINT32 count = 0;
++
++	for (UINT32 i = 0; i + 3 <= length; i++)
++	{
++		if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1)
++			continue;
++
++		/* A four-byte start code begins one byte before the three-byte one
++		 * this finds, and the length has to cover the whole prefix. */
++		if (count < RDPGFX_HEVC_MAX_NALUS)
++			offsets[count] = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
++
++		count++;
++		i += 2;
++	}
++
++	return count;
++}
++
++static UINT rdpgfx_write_hevc_nalu_lengths(wLog* log, wStream* s, const BYTE* data, UINT32 length)
++{
++	UINT32 offsets[RDPGFX_HEVC_MAX_NALUS] = { 0 };
++	const UINT32 count = rdpgfx_hevc_nalu_offsets(data, length, offsets);
++
++	if ((count == 0) || (count > RDPGFX_HEVC_MAX_NALUS) || (offsets[0] != 0))
++	{
++		WLog_Print(log, WLOG_ERROR,
++		           "cannot describe the HEVC bitstream: %" PRIu32 " NAL units, first at %" PRIu32,
++		           count, offsets[0]);
++		return ERROR_INVALID_DATA;
++	}
++
++	if (!Stream_EnsureRemainingCapacity(s, 4ULL + 4ULL * count + 1ULL))
++		return ERROR_INTERNAL_ERROR;
++
++	Stream_Write_UINT32(s, count * 4); /* cbNaluLengths (4 bytes) */
++
++	for (UINT32 i = 0; i < count; i++)
++	{
++		const UINT32 end = (i + 1 < count) ? offsets[i + 1] : length;
++
++		Stream_Write_UINT32(s, end - offsets[i]); /* naluLengths[i] (4 bytes) */
++	}
++
++	/*
++	 * One more byte before the bitstream, and it is not padding: without it the
++	 * client starts the bitstream one byte early and every frame is rejected.
++	 *
++	 * mstscax.dll's HevcDecoder::DecodeHeader hands its caller the header size
++	 * it consumed, computed as cbNaluLengths + 10 * numRegionRects + 8 -- and
++	 * + 9 instead when a mode flag on the decoder is set, which it is for a
++	 * plain 4:2:0 session. In that mode it also reads this byte and keeps bit 0.
++	 * Write it as zero: the header size is what the frame turns on, and bit 0
++	 * clear is what the client was seen to be given.
++	 *
++	 * The symptom of omitting it is worth naming, because it looks like a codec
++	 * problem and is not: the NAL lengths still sum to the bitstream, so with
++	 * the start one byte late the last unit runs one byte past the buffer, the
++	 * Media Foundation decode fails, and mstsc answers by turning off hardware
++	 * decoding for the whole session -- H.264 included.
++	 */
++	Stream_Write_UINT8(s, 0);
++
++	return CHANNEL_RC_OK;
++}
++
+ WINPR_ATTR_NODISCARD static UINT rdpgfx_write_h264_metablock(wLog* log, wStream* s,
+                                                              const RDPGFX_H264_METABLOCK* meta)
+ {
+@@ -796,6 +903,33 @@ WINPR_ATTR_NODISCARD static UINT rdpgfx_
+ 			}
+ 			break;
+ 
++#if defined(WITH_GFX_AZURE)
++			/* HEVC carries the AVC420 metablock, then a NALU length table, then
++			 * the bitstream. mstscax.dll's HevcDecoder::DecodeHeader is handed
++			 * the whole of bitmapData and reads all three in that order. */
++			case RDPGFX_CODECID_HEVC:
++			{
++				havc420 = (RDPGFX_AVC420_BITMAP_STREAM*)cmd->extra;
++
++				error = rdpgfx_write_h264_metablock(log, s, &havc420->meta);
++				if (error != CHANNEL_RC_OK)
++				{
++					WLog_Print(log, WLOG_ERROR, "rdpgfx_write_h264_metablock failed!");
++					return error;
++				}
++
++				error = rdpgfx_write_hevc_nalu_lengths(log, s, havc420->data, havc420->length);
++				if (error != CHANNEL_RC_OK)
++					return error;
++
++				if (!Stream_EnsureRemainingCapacity(s, havc420->length))
++					return ERROR_INTERNAL_ERROR;
++
++				Stream_Write(s, havc420->data, havc420->length);
++			}
++			break;
++#endif
++
+ 			case RDPGFX_CODECID_AVC444:
+ 			case RDPGFX_CODECID_AVC444v2:
+ 			{
+@@ -1465,6 +1599,18 @@ WINPR_ATTR_NODISCARD static UINT rdpgfx_
+ 			Stream_Peek_UINT32(s, capsSet->flags); /* capsData (4 bytes) */
+ 		}
+ 
++		WLog_Print(context->priv->log, WLOG_INFO,
++		           "CapsAdvertise[%" PRIu16 "]: version 0x%08" PRIX32 " length %" PRIu32
++		           " flags 0x%08" PRIX32 "%s%s",
++		           index, capsSet->version, capsSet->length, capsSet->flags,
++		           (capsSet->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) ? " AVC_DISABLED" : " AVC",
++#if defined(WITH_GFX_AZURE)
++		           (capsSet->flags & RDPGFX_CAPS_FLAG_HEVC) ? " HEVC" : ""
++#else
++		           ""
++#endif
++		);
++
+ 		if (!Stream_SafeSeek(s, capsSet->length))
+ 			goto fail;
+ 	}
+Index: freerdp3-3.30.0+dfsg/include/config/config.h.in
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/include/config/config.h.in
++++ freerdp3-3.30.0+dfsg/include/config/config.h.in
+@@ -59,6 +59,7 @@
+ #cmakedefine WITH_MEDIA_FOUNDATION
+ #cmakedefine WITH_MEDIACODEC
+ #cmakedefine WITH_GFX_AV1
++#cmakedefine WITH_GFX_AZURE
+ 
+ #cmakedefine WITH_VAAPI
+ #cmakedefine WITH_VIDEOTOOLBOX
+Index: freerdp3-3.30.0+dfsg/include/freerdp/channels/rdpgfx.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/include/freerdp/channels/rdpgfx.h
++++ freerdp3-3.30.0+dfsg/include/freerdp/channels/rdpgfx.h
+@@ -127,7 +127,17 @@ typedef enum WINPR_C23_ENUM_TYPE(uint32_
+ #if defined(WITH_GFX_AZURE)
+ 	RDPGFX_CAPVERSION_111 = 0x000b0101u, /**< Undocumented versions used by Azure */
+ 	RDPGFX_CAPVERSION_112 = 0x000b0200u, /**< Undocumented versions used by Azure */
+-	RDPGFX_CAPVERSION_113 = 0x000b0300u  /**< Undocumented versions used by Azure */
++	RDPGFX_CAPVERSION_113 = 0x000b0300u, /**< Undocumented versions used by Azure */
++	RDPGFX_CAPVERSION_115 =
++	    0x000b0500u /**< Undocumented. Read off the wire from the Microsoft client
++	                 * (mstsc build 10.0.29648): it advertises this version, and only
++	                 * this one, with RDPGFX_CAPS_FLAG_HEVC set. The 11.x versions
++	                 * above are what older clients offer; a server that stops at
++	                 * 0x000B0300 sees 0x000B0500 as an unknown capability set and
++	                 * falls back to a version that cannot carry the HEVC flag at all.
++	                 * 11.4 is deliberately absent: no client has been seen to send it
++	                 * and the low byte does not follow a pattern worth guessing at
++	                 * (111 ends in 0x01, 112 and 113 in 0x00). */
+ #endif
+ } RDPGFX_CAPVERSION;
+ 
+@@ -150,7 +160,13 @@ typedef enum WINPR_C23_ENUM_TYPE(uint32_
+ 	RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE = 0x00000080U /* 10.7+ */
+ #if defined(WITH_GFX_AZURE)
+ 	,
+-	RDPGFX_CAPS_FLAG_SCP_DISABLE = 0x00000100 /* 11.0+, undocumented, Azure only */
++	RDPGFX_CAPS_FLAG_SCP_DISABLE = 0x00000100, /* 11.0+, undocumented, Azure only */
++	RDPGFX_CAPS_FLAG_HEVC =
++	    0x00000400U /* 11.2+, undocumented. Read off the wire from the Microsoft client:
++	                 * with its internal HEVC bit forced on and off, the advertised flags
++	                 * differ by exactly this value on both 0x000B0200 and 0x000B0300.
++	                 * It cannot appear on any earlier capset version -- the client's own
++	                 * per-version mask stops at 0x62 up to and including 0x000A0600. */
+ #endif
+ #if defined(WITH_GFX_AV1)
+ 	,
+@@ -202,7 +218,13 @@ typedef enum WINPR_C23_ENUM_TYPE(uint16_
+ 	RDPGFX_CODECID_CAPROGRESSIVE_V2 = 0x000Du,
+ 	RDPGFX_CODECID_AVC444 = 0x000Eu,
+ 	RDPGFX_CODECID_AVC444v2 = 0x000Fu,
+-	RDPGFX_CODECID_MAX = 0x0010u
++	RDPGFX_CODECID_HEVC =
++	    0x0010u, /**< Undocumented. Read out of the Microsoft client's own codec-name table,
++	              * where the row above it is AVC = {0x0B, 0x0E, 0x0F} -- exactly the three
++	              * ids here -- which is what makes the HEVC row a reading and not a guess.
++	              * Carried in the AVC420 metablock: the same region rectangles and quality
++	              * vector, with an HEVC bitstream in place of the H.264 one. */
++	RDPGFX_CODECID_MAX = 0x0011u
+ } RDPGFX_CODECID;
+ 
+ #define RDPGFX_WIRE_TO_SURFACE_PDU_1_SIZE 17
+Index: freerdp3-3.30.0+dfsg/include/freerdp/codec/h264.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/include/freerdp/codec/h264.h
++++ freerdp3-3.30.0+dfsg/include/freerdp/codec/h264.h
+@@ -63,6 +63,8 @@ extern "C"
+ 		H264_CONTEXT_OPTION_USAGETYPE, /** @since version 3.6.0 */
+ 		H264_CONTEXT_OPTION_HW_ACCEL,  /** set to request hw accel, get to check if hw accel is on,
+ 		                                  @since version 3.11.0 */
++		H264_CONTEXT_OPTION_HEVC,      /** decode H.265 rather than H.264. Set before the first
++		                                  h264_context_reset. */
+ 	} H264_CONTEXT_OPTION;
+ 
+ 	FREERDP_API void free_h264_metablock(RDPGFX_H264_METABLOCK* meta);
+Index: freerdp3-3.30.0+dfsg/libfreerdp/codec/h264.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/codec/h264.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/codec/h264.c
+@@ -776,6 +776,13 @@ static BOOL h264_context_init(H264_CONTE
+ 		    strcmp(subsystem->name, "OpenH264") == 0)
+ 			continue;
+ 
++		/* H.265 is only implemented by the libavcodec subsystem. Without this
++		 * the context happily initializes on OpenH264 and then fails one frame
++		 * at a time, which reads as a bad bitstream rather than a decoder that
++		 * was never going to understand it. */
++		if (h264->hevc && strcmp(subsystem->name, "libavcodec") != 0)
++			continue;
++
+ 		if (subsystem->Init(h264))
+ 		{
+ 			h264->subsystem = subsystem;
+@@ -913,6 +920,23 @@ BOOL h264_context_set_option(H264_CONTEX
+ 		case H264_CONTEXT_OPTION_HW_ACCEL:
+ 			h264->hwAccel = (value);
+ 			return TRUE;
++		case H264_CONTEXT_OPTION_HEVC:
++		{
++			const BOOL hevc = (value != 0);
++
++			if (h264->hevc == hevc)
++				return TRUE;
++
++			h264->hevc = hevc;
++
++			/* The subsystem was chosen when the context was created, before
++			 * anyone said which codec it was for. Choose again. */
++			if (h264->subsystem && h264->subsystem->Uninit)
++				h264->subsystem->Uninit(h264);
++
++			h264->subsystem = nullptr;
++			return h264_context_init(h264);
++		}
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+ 			           option);
+@@ -937,6 +961,8 @@ UINT32 h264_context_get_option(H264_CONT
+ 			return h264->UsageType;
+ 		case H264_CONTEXT_OPTION_HW_ACCEL:
+ 			return h264->hwAccel;
++		case H264_CONTEXT_OPTION_HEVC:
++			return h264->hevc;
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+ 			           option);
+Index: freerdp3-3.30.0+dfsg/libfreerdp/codec/h264.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/codec/h264.h
++++ freerdp3-3.30.0+dfsg/libfreerdp/codec/h264.h
+@@ -53,6 +53,7 @@ extern "C"
+ 	struct S_H264_CONTEXT
+ 	{
+ 		BOOL Compressor;
++		BOOL hevc;
+ 
+ 		UINT32 width;
+ 		UINT32 height;
+Index: freerdp3-3.30.0+dfsg/libfreerdp/codec/h264_ffmpeg.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/codec/h264_ffmpeg.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/codec/h264_ffmpeg.c
+@@ -721,11 +721,13 @@ static BOOL libavcodec_init(H264_CONTEXT
+ 
+ 	if (!h264->Compressor)
+ 	{
+-		sys->codecDecoder = avcodec_find_decoder(AV_CODEC_ID_H264);
++		sys->codecDecoder =
++		    avcodec_find_decoder(h264->hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
+ 
+ 		if (!sys->codecDecoder)
+ 		{
+-			WLog_Print(h264->log, WLOG_ERROR, "Failed to find libav H.264 codec");
++			WLog_Print(h264->log, WLOG_ERROR, "Failed to find libav %s codec",
++			           h264->hevc ? "H.265" : "H.264");
+ 			goto EXCEPTION;
+ 		}
+ 
+Index: freerdp3-3.30.0+dfsg/libfreerdp/gdi/gfx.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/gdi/gfx.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/gdi/gfx.c
+@@ -762,6 +762,97 @@ fail:
+  *
+  * @return 0 on success, otherwise a Win32 error code
+  */
++#if defined(WITH_GFX_AZURE)
++/**
++ * An HEVC frame. The region rectangles come from the metablock in front of the
++ * bitstream, the same as AVC420 -- the channel has already read past the NAL
++ * unit length table that sits between them.
++ */
++static UINT gdi_SurfaceCommand_HEVC(rdpGdi* gdi, RdpgfxClientContext* context,
++                                    const RDPGFX_SURFACE_COMMAND* cmd)
++{
++#ifdef WITH_GFX_H264
++	gdiGfxSurface* surface = nullptr;
++	RDPGFX_H264_METABLOCK* meta = nullptr;
++	RDPGFX_AVC420_BITMAP_STREAM* bs = nullptr;
++	INT32 rc = 0;
++	UINT status = CHANNEL_RC_OK;
++
++	WINPR_ASSERT(gdi);
++	WINPR_ASSERT(context);
++	WINPR_ASSERT(cmd);
++
++	WINPR_ASSERT(context->GetSurfaceData);
++	surface =
++	    (gdiGfxSurface*)context->GetSurfaceData(context, (UINT16)MIN(UINT16_MAX, cmd->surfaceId));
++
++	if (!surface)
++	{
++		WLog_ERR(TAG, "unable to retrieve surfaceData for surfaceId=%" PRIu32 "", cmd->surfaceId);
++		return ERROR_NOT_FOUND;
++	}
++
++	if (!surface->h264)
++	{
++		surface->h264 = h264_context_new(FALSE);
++
++		if (!surface->h264)
++		{
++			WLog_ERR(TAG, "unable to create h264 context");
++			return ERROR_NOT_ENOUGH_MEMORY;
++		}
++
++		/* Before the reset: the decoder is created there, and this is what
++		 * decides which one. */
++		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_HEVC, 1))
++			return ERROR_INTERNAL_ERROR;
++
++		if (!h264_context_reset(surface->h264, surface->width, surface->height))
++			return ERROR_INTERNAL_ERROR;
++	}
++
++	if (!is_within_surface(surface, cmd))
++		return ERROR_INVALID_DATA;
++
++	bs = (RDPGFX_AVC420_BITMAP_STREAM*)cmd->extra;
++
++	if (!bs)
++		return ERROR_INTERNAL_ERROR;
++
++	meta = &(bs->meta);
++	rc = avc420_decompress(surface->h264, bs->data, bs->length, surface->data, surface->format,
++	                       surface->scanline, surface->width, surface->height, meta->regionRects,
++	                       meta->numRegionRects);
++
++	if (rc < 0)
++	{
++		WLog_WARN(TAG, "HEVC decompress failure: %" PRId32 ", ignoring update.", rc);
++		return CHANNEL_RC_OK;
++	}
++
++	for (UINT32 i = 0; i < meta->numRegionRects; i++)
++	{
++		if (!region16_union_rect(&(surface->invalidRegion), &(surface->invalidRegion),
++		                         &(meta->regionRects[i])))
++			return ERROR_INTERNAL_ERROR;
++	}
++
++	status = IFCALLRESULT(CHANNEL_RC_OK, context->UpdateSurfaceArea, context, surface->surfaceId,
++	                      meta->numRegionRects, meta->regionRects);
++
++	if (status != CHANNEL_RC_OK)
++	{
++		WLog_ERR(TAG, "UpdateSurfaceArea failed with error %" PRIu32 "!", status);
++		return status;
++	}
++
++	return CHANNEL_RC_OK;
++#else
++	return ERROR_NOT_SUPPORTED;
++#endif
++}
++#endif
++
+ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+                                       const RDPGFX_SURFACE_COMMAND* cmd)
+ {
+@@ -1207,6 +1298,12 @@ static UINT gdi_SurfaceCommand(RdpgfxCli
+ 			status = gdi_SurfaceCommand_AVC444(gdi, context, cmd);
+ 			break;
+ 
++#if defined(WITH_GFX_AZURE)
++		case RDPGFX_CODECID_HEVC:
++			status = gdi_SurfaceCommand_HEVC(gdi, context, cmd);
++			break;
++#endif
++
+ 		case RDPGFX_CODECID_ALPHA:
+ 			status = gdi_SurfaceCommand_Alpha(gdi, context, cmd);
+ 			break;
+Index: freerdp3-3.30.0+dfsg/libfreerdp/utils/gfx.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/utils/gfx.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/utils/gfx.c
+@@ -92,6 +92,9 @@ const char* rdpgfx_get_codec_id_string(U
+ 		case RDPGFX_CODECID_AVC444v2:
+ 			return "RDPGFX_CODECID_AVC444v2";
+ 
++		case RDPGFX_CODECID_HEVC:
++			return "RDPGFX_CODECID_HEVC";
++
+ 		case RDPGFX_CODECID_ALPHA:
+ 			return "RDPGFX_CODECID_ALPHA";
+ 
+@@ -157,6 +160,7 @@ static const char* rdpgfx_caps_flag_str_
+ 		EVCASE(RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE);
+ #if defined(WITH_GFX_AZURE)
+ 		EVCASE(RDPGFX_CAPS_FLAG_SCP_DISABLE);
++		EVCASE(RDPGFX_CAPS_FLAG_HEVC);
+ #endif
+ #if defined(WITH_GFX_AV1)
+ 		EVCASE(RDPGFX_CAPS_FLAG_AV1_I444_SUPPORTED);

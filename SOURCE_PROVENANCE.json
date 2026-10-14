@@ -1,0 +1,11 @@
+{
+  "component": "freerdp",
+  "source_package": "freerdp3",
+  "base_version": "3.30.0+dfsg-0ubuntu0.26.04.2+altarscn15",
+  "upstream_archive": "freerdp3_3.30.0+dfsg.orig.tar.xz",
+  "upstream_sha256": "e2f8c640a31c7bda3342a691569158e4782e661c8609756a11b7676ece43a249",
+  "downstream_commit": null,
+  "import_date": "2026-10-14",
+  "model": "quilt",
+  "note": "首次公开导入为源码快照；不包含私有历史、运行凭据或构建产物。"
+}

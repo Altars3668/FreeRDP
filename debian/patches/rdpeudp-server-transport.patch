@@ -1,0 +1,4345 @@
+Index: freerdp3-3.30.0+dfsg/include/freerdp/channels/wtsvc.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/include/freerdp/channels/wtsvc.h
++++ freerdp3-3.30.0+dfsg/include/freerdp/channels/wtsvc.h
+@@ -81,6 +81,16 @@ extern "C"
+ 	WINPR_ATTR_NODISCARD
+ 	FREERDP_API BYTE WTSVirtualChannelManagerGetDrdynvcState(HANDLE hServer);
+ 
++	WINPR_ATTR_NODISCARD
++	FREERDP_API UINT16 WTSVirtualChannelManagerGetDvcSpokenVersion(HANDLE hServer);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL WTSVirtualChannelManagerSendSoftSyncRequest(HANDLE hServer, UINT32 tunnelType);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL WTSVirtualChannelManagerProcessUdpData(HANDLE hServer, const BYTE* data,
++	                                                        size_t len);
++
+ 	FREERDP_API void WTSVirtualChannelManagerSetDVCCreationCallback(HANDLE hServer,
+ 	                                                                psDVCCreationStatusCallback cb,
+ 	                                                                void* userdata);
+Index: freerdp3-3.30.0+dfsg/include/freerdp/peer.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/include/freerdp/peer.h
++++ freerdp3-3.30.0+dfsg/include/freerdp/peer.h
+@@ -86,6 +86,9 @@ extern "C"
+ 	typedef BOOL (*psPeerLogon)(freerdp_peer* peer, const SEC_WINNT_AUTH_IDENTITY* identity,
+ 	                            BOOL automatic);
+ 
++	typedef BOOL (*psPeerMultitransportRequested)(freerdp_peer* peer, UINT16 transportFlags,
++	                                              const BYTE* cookie);
++
+ 	typedef BOOL (*psPeerSendServerRedirection)(freerdp_peer* peer,
+ 	                                            const rdpRedirection* redirection);
+ 	typedef BOOL (*psPeerAdjustMonitorsLayout)(freerdp_peer* peer);
+@@ -161,6 +164,7 @@ extern "C"
+ 		WINPR_ATTR_NODISCARD ALIGN64 psPeerPostConnect PostConnect;
+ 		WINPR_ATTR_NODISCARD ALIGN64 psPeerActivate Activate;
+ 		WINPR_ATTR_NODISCARD ALIGN64 psPeerLogon Logon;
++		ALIGN64 psPeerMultitransportRequested MultitransportRequested;
+ 
+ 		WINPR_ATTR_NODISCARD ALIGN64 psPeerSendServerRedirection SendServerRedirection;
+ 
+Index: freerdp3-3.30.0+dfsg/include/freerdp/rdpeudp.h
+===================================================================
+--- /dev/null
++++ freerdp3-3.30.0+dfsg/include/freerdp/rdpeudp.h
+@@ -0,0 +1,95 @@
++/**
++ * FreeRDP: A Remote Desktop Protocol Implementation
++ * RDPEUDP/RDPEMT server transport (MS-RDPEUDP, MS-RDPEMT)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef FREERDP_RDPEUDP_H
++#define FREERDP_RDPEUDP_H
++
++#include <freerdp/api.h>
++#include <freerdp/types.h>
++#include <winpr/wtypes.h>
++
++/*
++ * What a server needs to carry a session's dynamic virtual channels over UDP.
++ *
++ * The server owns one UDP socket and demultiplexes datagrams to per-client
++ * connections. A connection is claimed by the cookie the core hands out with
++ * the multitransport request, which is what ties an arriving SYN to the TCP
++ * session that asked for it.
++ *
++ * This is the subset an embedder uses; the wire protocol itself stays private.
++ */
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++	typedef struct rdp_rdpeudp_server rdpRdpeudpServer;
++	typedef struct rdp_rdpeudp_conn rdpRdpeudpConn;
++
++	/* Called once the DTLS handshake completes and the connection can carry data. */
++	typedef void (*RdpeudpConnectedCb)(rdpRdpeudpConn* conn, void* userdata);
++
++	FREERDP_API rdpRdpeudpServer* rdpeudp_server_new(int port);
++	FREERDP_API void rdpeudp_server_free(rdpRdpeudpServer* server);
++
++	/* The socket to poll; the embedder drives check_fds when it is readable. */
++	FREERDP_API int rdpeudp_server_get_fd(rdpRdpeudpServer* server);
++	FREERDP_API int rdpeudp_server_check_fds(rdpRdpeudpServer* server);
++
++	/* DTLS needs the same certificate the TCP side presents. */
++	FREERDP_API BOOL rdpeudp_server_set_tls_credentials(rdpRdpeudpServer* server,
++	                                                    const char* cert_file,
++	                                                    const char* key_file);
++
++	/* Claim the connection a client will open with this cookie. */
++	FREERDP_API rdpRdpeudpConn* rdpeudp_server_register_cookie(rdpRdpeudpServer* server,
++	                                                           const BYTE* cookie,
++	                                                           RdpeudpConnectedCb cb,
++	                                                           void* userdata);
++
++	FREERDP_API void rdpeudp_conn_free(rdpRdpeudpConn* conn);
++
++	/*
++	 * Hand a connected tunnel to the session it belongs to.
++	 *
++	 * From here the core decides when to use it: after Soft-Sync has moved the
++	 * graphics channel across, and once the path has carried traffic both ways.
++	 * Embedders should not need to know either rule.
++	 */
++	FREERDP_API void freerdp_peer_set_udp_connection(freerdp_peer* peer,
++	                                                 rdpRdpeudpConn* conn);
++
++	/* Application data, with the RDPEMT framing already stripped. */
++	FREERDP_API int rdpemt_conn_read(rdpRdpeudpConn* conn, BYTE* data, size_t len);
++
++	/*
++	 * Is there anything waiting to be read?
++	 *
++	 * The tunnel is drained by the thread that owns the channel manager, and
++	 * that thread only looks when it has something of its own to do. Whoever
++	 * receives the datagrams can use this to wake it -- otherwise receiving
++	 * depends on sending, and a session waiting on acknowledgements that have
++	 * already arrived will wait for ever.
++	 */
++	FREERDP_API BOOL rdpeudp_conn_has_pending_data(rdpRdpeudpConn* conn);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* FREERDP_RDPEUDP_H */
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/CMakeLists.txt
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/CMakeLists.txt
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/CMakeLists.txt
+@@ -110,6 +110,8 @@ set(${MODULE_PREFIX}_SRCS
+     heartbeat.h
+     multitransport.c
+     multitransport.h
++    rdpeudp.c
++    rdpeudp.h
+     timezone.c
+     timezone.h
+     childsession.c
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/channels.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/channels.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/channels.c
+@@ -48,6 +48,8 @@
+ #include "server.h"
+ #include "channels.h"
+ 
++#include <freerdp/channels/drdynvc.h>
++
+ #define TAG FREERDP_TAG("core.channels")
+ 
+ BOOL freerdp_channel_send(rdpRdp* rdp, UINT16 channelId, const BYTE* data, size_t size)
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/connection.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/connection.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/connection.c
+@@ -1559,6 +1559,9 @@ BOOL rdp_server_accept_nego(rdpRdp* rdp,
+ 	SelectedProtocol = nego_get_selected_protocol(nego);
+ 	status = FALSE;
+ 
++	if (SelectedProtocol & PROTOCOL_FAILED_NEGO)
++		return FALSE;
++
+ 	if (freerdp_settings_get_bool(rdp->settings, FreeRDP_VmConnectMode) &&
+ 	    SelectedProtocol != PROTOCOL_RDP)
+ 		/* When behind a Hyper-V proxy, security != RDP is handled by the host. */
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/freerdp.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/freerdp.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/freerdp.c
+@@ -1157,6 +1157,12 @@ const char* freerdp_get_last_error_categ
+ 	return string;
+ }
+ 
++static BOOL freerdp_is_graceful_disconnect(UINT32 lastError)
++{
++	return lastError == FREERDP_ERROR_RPC_INITIATED_DISCONNECT ||
++	       lastError == FREERDP_ERROR_LOGOFF_BY_USER;
++}
++
+ void freerdp_set_last_error_ex(rdpContext* context, UINT32 lastError, const char* fkt,
+                                const char* file, int line)
+ {
+@@ -1165,9 +1171,11 @@ void freerdp_set_last_error_ex(rdpContex
+ 
+ 	if (lastError)
+ 	{
+-		if (WLog_IsLevelActive(context->log, WLOG_ERROR))
++		/* Graceful disconnect codes are informational, not errors */
++		const DWORD level = freerdp_is_graceful_disconnect(lastError) ? WLOG_WARN : WLOG_ERROR;
++		if (WLog_IsLevelActive(context->log, level))
+ 		{
+-			WLog_PrintTextMessage(context->log, WLOG_ERROR, (size_t)line, file, fkt,
++			WLog_PrintTextMessage(context->log, level, (size_t)line, file, fkt,
+ 			                      "%s [0x%08" PRIX32 "]", freerdp_get_last_error_name(lastError),
+ 			                      lastError);
+ 		}
+@@ -1181,10 +1189,14 @@ void freerdp_set_last_error_ex(rdpContex
+ 	}
+ 	else if (context->LastError != FREERDP_ERROR_SUCCESS)
+ 	{
+-		if (WLog_IsLevelActive(context->log, WLOG_ERROR))
++		const DWORD level = (freerdp_is_graceful_disconnect(lastError) &&
++		                     freerdp_is_graceful_disconnect(context->LastError))
++		                        ? WLOG_WARN
++		                        : WLOG_ERROR;
++		if (WLog_IsLevelActive(context->log, level))
+ 		{
+-			WLog_PrintTextMessage(context->log, WLOG_ERROR, (size_t)line, file, fkt,
+-			                      "TODO: Trying to set error code %s, but %s already set!",
++			WLog_PrintTextMessage(context->log, level, (size_t)line, file, fkt,
++			                      "Trying to set error code %s, but %s already set",
+ 			                      freerdp_get_last_error_name(lastError),
+ 			                      freerdp_get_last_error_name(context->LastError));
+ 		}
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/multitransport.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/multitransport.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/multitransport.c
+@@ -36,6 +36,7 @@ struct rdp_multitransport
+ 	UINT32 reliableReqId;
+ 
+ 	BYTE reliableCookie[RDPUDP_COOKIE_LEN];
++	BOOL reliableCookieReady;
+ 	BYTE reliableCookieHash[RDPUDP_COOKIE_HASHLEN];
+ };
+ 
+@@ -113,6 +114,20 @@ static BOOL multitransport_request_send(
+ 	Stream_Zero(s, 2);                          /* reserved (2 bytes) */
+ 	Stream_Write(s, cookie, RDPUDP_COOKIE_LEN); /* securityCookie (16 bytes) */
+ 
++	/*
++	 * The securityCookie is not logged.
++	 *
++	 * It is the whole of the authorization for a UDP tunnel to join this
++	 * session: present it and the tunnel is created. A hexdump of it stood
++	 * here, and the sweep that removed exactly this shape from the transport
++	 * did not reach into this file -- so the capability was still being handed
++	 * to anyone who could read the journal. The format loop also ran whether or
++	 * not debug output was enabled.
++	 */
++	WLog_DBG(TAG,
++	         "multitransport_request_send: requestId=%" PRIu32 ", protocol=0x%04" PRIx16,
++	         reqId, reqProto);
++
+ 	return rdp_send_message_channel_pdu(multi->rdp, s, sec_flags | SEC_TRANSPORT_REQ);
+ }
+ 
+@@ -126,8 +141,12 @@ state_run_t multitransport_server_reques
+ 	if (reqProto == INITIATE_REQUEST_PROTOCOL_UDPFECR)
+ 	{
+ 		multi->reliableReqId = reqId++;
+-		if (winpr_RAND(multi->reliableCookie, sizeof(multi->reliableCookie)) < 0)
+-			return STATE_RUN_FAILED;
++		if (!multi->reliableCookieReady)
++		{
++			if (winpr_RAND(multi->reliableCookie, sizeof(multi->reliableCookie)) < 0)
++				return STATE_RUN_FAILED;
++			multi->reliableCookieReady = TRUE;
++		}
+ 
+ 		return multitransport_request_send(multi, multi->reliableReqId, reqProto,
+ 		                                   multi->reliableCookie)
+@@ -239,3 +258,23 @@ void multitransport_free(rdpMultitranspo
+ {
+ 	free(multitransport);
+ }
++
++const BYTE* multitransport_get_cookie(rdpMultitransport* multi)
++{
++	WINPR_ASSERT(multi);
++
++	/*
++	 * The application is told the cookie so it can have a UDP listener waiting
++	 * before the client's SYN arrives, which means it is asked for the cookie
++	 * before the request is sent. Generate it on first use rather than when the
++	 * request goes out: asking first and generating later handed the caller
++	 * sixteen zeroes, and every tunnel it then accepted failed to match.
++	 */
++	if (!multi->reliableCookieReady)
++	{
++		if (winpr_RAND(multi->reliableCookie, sizeof(multi->reliableCookie)) < 0)
++			return NULL;
++		multi->reliableCookieReady = TRUE;
++	}
++	return multi->reliableCookie;
++}
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/multitransport.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/multitransport.h
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/multitransport.h
+@@ -63,4 +63,7 @@ WINPR_ATTR_MALLOC(multitransport_free, 1
+ WINPR_ATTR_NODISCARD
+ FREERDP_LOCAL rdpMultitransport* multitransport_new(rdpRdp* rdp, UINT16 protocol);
+ 
++/* Get the cookie from the last server request (for UDP listener registration) */
++FREERDP_LOCAL const BYTE* multitransport_get_cookie(rdpMultitransport* multi);
++
+ #endif /* FREERDP_LIB_CORE_MULTITRANSPORT_H */
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/peer.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/peer.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/peer.c
+@@ -956,6 +956,23 @@ static state_run_t peer_recv_callback_in
+ 			if (settings->SupportMultitransport &&
+ 			    ((settings->MultitransportFlags & INITIATE_REQUEST_PROTOCOL_UDPFECR) != 0))
+ 			{
++				/*
++				 * Notify the application so it can register the cookie with its
++				 * RDPEUDP server before the client SYN arrives.
++				 *
++				 * Inside the check, not before it. Standing the listener up
++				 * regardless meant a server with multitransport switched off
++				 * still bound the UDP port and ran every parser behind it for
++				 * the life of every session -- the switch turned off the
++				 * request to the client and nothing else.
++				 */
++				if (client->MultitransportRequested)
++				{
++					const BYTE* cookie = multitransport_get_cookie(rdp->multitransport);
++					client->MultitransportRequested(
++					    client, INITIATE_REQUEST_PROTOCOL_UDPFECR, cookie);
++				}
++
+ 				/* only UDP reliable for now, nobody does lossy UDP (MS-RDPUDP only) these days */
+ 				ret = multitransport_server_request(rdp->multitransport,
+ 				                                    INITIATE_REQUEST_PROTOCOL_UDPFECR);
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/rdp.h
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/rdp.h
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/rdp.h
+@@ -41,6 +41,7 @@
+ #include "tpdu.h"
+ #include "nego.h"
+ #include "input.h"
++#include "rdpeudp.h"
+ #include "update.h"
+ #include "license.h"
+ #include "errinfo.h"
+@@ -202,6 +203,12 @@ struct rdp_rdp
+ 
+ 	BOOL monitor_layout_pdu;
+ 	BOOL was_deactivated;
++
++	/* RDPEUDP/RDPEMT: UDP transport for DRDYNVC (RDPGFX) routing */
++	rdpRdpeudpConn* udpConn;       /* NULL until RDPEMT tunnel connected */
++	BOOL udpSoftSyncRequested;     /* TRUE after Soft-Sync Request sent */
++	BOOL udpSoftSyncDone;          /* TRUE after Soft-Sync Response received */
++	UINT64 udpActivatedTimeMs;     /* timestamp when udpSoftSyncDone became TRUE */
+ 	UINT32 deactivated_width;
+ 	UINT32 deactivated_height;
+ 
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/rdpeudp.c
+===================================================================
+--- /dev/null
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/rdpeudp.c
+@@ -0,0 +1,3283 @@
++/**
++ * FreeRDP: A Remote Desktop Protocol Implementation
++ * MS-RDPEUDP - UDP Transport Extension
++ *
++ * Implements the server side of MS-RDPEUDP (version 2 with DTLS).
++ * Protocol flow:
++ *   1. Server sends Initiate Multitransport Request (cookie) over TCP
++ *   2. Client sends RDPEUDP SYN (v1 format, SYNEX flag, cookie) over UDP
++ *   3. Server replies SYN-ACK (v1 format)
++ *   4. Client sends ACK → switch to RDPEUDP2 framing
++ *   5. DTLS handshake inside RDPEUDP2 DATA packets
++ *   6. Application data flows over DTLS over RDPEUDP2
++ *
++ * Copyright 2026 Geoffrey
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++#include <freerdp/config.h>
++#include <freerdp/log.h>
++
++#include <winpr/assert.h>
++#include <winpr/crypto.h>
++
++#include <errno.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++#include <openssl/ssl.h>
++#include <openssl/err.h>
++
++#include "rdp.h"
++#include "rdpeudp.h"
++
++#define TAG FREERDP_TAG("core.rdpeudp")
++
++/* ============================================================
++ * Internal structures
++ * ============================================================ */
++
++/* Pending cookie registration (waiting for SYN from client) */
++typedef struct
++{
++	BYTE cookie[16];
++	RdpeudpConnectedCb callback;
++	void* userdata;
++	rdpRdpeudpConn* conn;  /* NULL until SYN received */
++	UINT64 registered_at;  /* monotonic time for expiry */
++} RdpeudpPendingCookie;
++
++/* Per-client UDP connection */
++/* How far ahead of everything seen so far a sequence number may credibly be.
++ * Generous against reordering, far short of the sequence space. */
++/* The largest v1 packet the retransmit buffer can hold. Nothing larger may be
++ * sent: an unfiled packet cannot be recovered. */
++#define RDPEUDP_RETRANSMIT_PKT_MAX 1300
++#define RDPEUDP_RECV_WINDOW_MAX 4096
++/* How many recent source packets the acknowledgement vector can describe. */
++#define RDPEUDP_RECV_HISTORY 1024
++/*
++ * How many out-of-order packets may wait for the one in front of them.
++ *
++ * What rides on this transport is a TLS stream, reassembled strictly in order,
++ * so a packet that arrives early cannot simply be handed over -- and one that
++ * arrives late cannot simply be dropped, which is what a retransmission is.
++ * Both have to wait here until the gap ahead of them is filled.
++ *
++ * Sized to the largest send window the other end can have in flight, so a full
++ * window arriving in any order still fits.
++ */
++#define RDPEUDP_REORDER_WINDOW 256
++
++/* The two-bit state at the top of an acknowledgement vector element. */
++#define RDPUDP_VECTOR_RECEIVED 0
++#define RDPUDP_VECTOR_NOT_YET_RECEIVED 3
++/* How many separate holes in one vector are worth acting on. */
++#define RDPEUDP_MAX_REPORTED_GAPS 16
++
++/* An inclusive run of sequence numbers, wrap included. */
++typedef struct
++{
++	UINT32 lo;
++	UINT32 hi;
++} RdpeudpSeqRange;
++
++struct rdp_rdpeudp_conn
++{
++	rdpRdpeudpServer* server;
++	RdpeudpState state;
++
++	/*
++	 * Everything below is reached from two threads.
++	 *
++	 * The session's main context reads the socket, drives TLS and answers; the
++	 * peer thread writes channel data through the same TLS object from
++	 * WTSVirtualChannelManagerCheckFileDescriptorEx. An SSL object may not be
++	 * used by two threads at once -- OpenSSL requires the caller to serialise
++	 * it -- and the sequence numbers, the retransmit buffer and the congestion
++	 * window are shared just as directly.
++	 *
++	 * Recursive, because the outer entry points lock and the inner helpers are
++	 * shared between locked and unlocked callers.
++	 */
++	CRITICAL_SECTION lock;
++
++	/* Peer address */
++	struct sockaddr_storage peer_addr;
++	socklen_t peer_addr_len;
++
++	/*
++	 * An address that claims to be this connection moved, not yet believed.
++	 *
++	 * The only thing that can prove a datagram belongs to this connection is
++	 * the TLS session, so a new address is held here until a record from it
++	 * decrypts, and only then does it become the address we reply to. Believing
++	 * the claim on sight -- which is what matching the source IP and a sequence
++	 * number in the plaintext header amounts to -- means anyone sharing the
++	 * client's address, and anyone able to forge it, can point the session's
++	 * output at themselves.
++	 */
++	struct sockaddr_storage rebind_addr;
++	socklen_t rebind_addr_len;
++	BOOL rebind_pending;
++
++	/* RDPEUDP v1 handshake state */
++	UINT32 sn_initial_recv;   /* client's initial sequence number */
++	UINT32 sn_initial_send;   /* our initial sequence number */
++	UINT16 upstream_mtu;
++	UINT16 downstream_mtu;
++	UINT16 negotiated_version; /* RDPUDP_VERSION_1, _2 or _3 */
++
++	/* RDPEUDP2 sequence numbers */
++	UINT16 send_seq;
++	UINT16 recv_seq;
++
++	/* v1 sequence number tracking */
++	UINT32 v1_send_sn;    /* next source SN for outgoing v1 DATA */
++	UINT32 v1_recv_sn;    /* last received client source SN (for ACK) */
++	UINT32 v1_recv_sn_highest; /* highest seen SN for duplicate detection */
++	/*
++	 * Which of the recent source packets actually arrived.
++	 *
++	 * The acknowledgement vector exists to describe gaps. Claiming every
++	 * datagram from the start of the connection was received -- which is what
++	 * this did, having tracked nothing -- tells the peer to drop from its
++	 * retransmit buffer packets that never arrived, and the byte stream it
++	 * reassembles in order then has a hole nothing will ever fill. On the lossy
++	 * links this transport exists for, that is the failure it is meant to
++	 * prevent.
++	 */
++	BYTE recv_seen[RDPEUDP_RECV_HISTORY / 8];
++	/* Zero is a sequence number like any other -- and after a wrap it is the
++	 * current one -- so "nothing seen yet" needs saying separately. */
++	BOOL v1_recv_sn_valid;
++	/*
++	 * Reassembly, because the thing being carried cannot tolerate a gap.
++	 *
++	 * The payload of these packets is a TLS byte stream: the far end parses it
++	 * strictly in order, and a hole is not something it recovers from -- it
++	 * simply stops, with no error anywhere, in both directions at once.
++	 *
++	 * This used to hand each payload to the TLS layer as it arrived and drop
++	 * anything not strictly newer than the highest seen. That is the wrong
++	 * test twice over. A packet arriving out of order was spliced into the
++	 * stream at the wrong place, and a retransmission -- which by construction
++	 * carries the sequence number of the packet it replaces, and therefore is
++	 * never newer than what has arrived since -- was discarded as a duplicate.
++	 * So the one mechanism that exists to repair a loss could never repair
++	 * anything: the first lost datagram ended the tunnel for good.
++	 */
++	UINT32 v1_recv_next;      /* the sn whose payload goes to TLS next */
++	struct
++	{
++		BOOL in_use;
++		UINT16 len;
++		BYTE data[RDPEUDP_RETRANSMIT_PKT_MAX];
++	} reorder_buf[RDPEUDP_REORDER_WINDOW];
++	/*
++	 * When the stream first started waiting for v1_recv_next, and whether that
++	 * has been complained about.
++	 *
++	 * A tunnel that stops delivering used to say nothing at all: the drop was
++	 * a debug line, the full send window was a debug line, and what reached the
++	 * session was simply silence in both directions. Whatever the next reason
++	 * turns out to be, it should not have to be inferred from the shape of the
++	 * damage three layers up.
++	 */
++	UINT64 recv_stalled_since_ms;
++	BOOL recv_stall_reported;
++	/*
++	 * Set when the peer has stopped acknowledging for long enough that
++	 * retransmitting is pointless. It stops the retransmissions and takes the
++	 * tunnel out of the sending path -- but it does not close the connection.
++	 *
++	 * Closing it is what turned a stalled picture into a dead session. The
++	 * datagrams the client keeps sending then arrive at a port with nothing
++	 * behind it, the host answers ICMP port-unreachable, and a Windows UDP
++	 * socket that receives one fails every later send with WSAECONNRESET.
++	 * mstsc's own log shows exactly that: seven
++	 * UdpClientEventUdpConnectionFailedOnSend in one second, then
++	 * ConnectionClosed, then the whole session gone. And nothing in MS-RDPEMT
++	 * lets a client move its channels back to TCP once Soft-Sync has moved
++	 * them, so the client has nowhere to go.
++	 *
++	 * Staying open costs nothing and keeps the client's socket healthy: its
++	 * data still arrives and is still parsed, which is where the frame
++	 * acknowledgements come from, while ours goes over TCP.
++	 */
++	BOOL retransmit_given_up;
++	/*
++	 * A hole the peer has reported and we are holding the acknowledgement
++	 * below, so it stays in the retransmit buffer until it is filled. An
++	 * episode ends when the acknowledgement gets past it.
++	 *
++	 * A repaired hole is the transport working, and a link losing a few
++	 * datagrams a second produces one several times a second -- so these are
++	 * counted rather than each one being announced. What gets said out loud is
++	 * the first one, a summary every so often, and any hole that is not
++	 * repaired promptly, which is the one that means something is wrong.
++	 */
++	/*
++	 * How many datagrams are actually still unaccounted for.
++	 *
++	 * Not the same as the span above the cumulative acknowledgement: when the
++	 * peer reports a hole, the acknowledgement is held below it while every
++	 * datagram after it may well have arrived. Counting the span would let one
++	 * lost datagram fill the send window and stop the stream until it was
++	 * repaired. This counts slots still in use in the retransmit buffer, which
++	 * is what the peer's acknowledgement vector actually said.
++	 */
++	UINT32 unacked_count;
++	BOOL ack_gap_pending;
++	BOOL ack_gap_slow_reported;
++	/*
++	 * The next retransmit pass is answering the peer's report of a hole, not a
++	 * timer that expired. It must not be counted as a timeout: backing off on
++	 * news that arrived on time is how a fast path turns into a slow one.
++	 */
++	BOOL fast_retransmit_pending;
++	UINT64 ack_gap_started_ms;
++	UINT64 ack_gap_summary_due_ms;
++	UINT64 ack_gap_worst_ms;
++	UINT32 ack_gap_episodes;
++	UINT32 ack_gap_datagrams;
++	#define ACK_GAP_SUMMARY_INTERVAL_MS 60000
++	/* Longer than this and the hole is not being repaired, it is stuck. */
++	#define ACK_GAP_SLOW_MS 2000
++	/*
++	 * What the peer actually puts in the two sequence numbers.
++	 *
++	 * MS-RDPEUDP gives RDPUDP_SOURCE_PAYLOAD_HEADER both a coded and a source
++	 * sequence number, and they do not mean the same thing: the first counts
++	 * transmissions on the wire, the second names the data. This server writes
++	 * the same value into both and resends a lost packet verbatim, so for
++	 * traffic it sends they never diverge -- but nothing here has ever looked
++	 * at what the client sends, and the whole question of which number a
++	 * retransmission carries turns on that. Report it once, from the peer's own
++	 * packets, rather than assuming the client behaves like the server.
++	 */
++	BOOL sn_fields_reported;
++	UINT32 source_sn_highest;
++	BOOL source_sn_valid;
++	BOOL source_replay_reported;
++	UINT32 v1_acked_sn;   /* highest SN acknowledged by peer (from FEC snSourceAck) */
++	UINT16 peer_recv_window; /* peer's receive window size (from FEC uReceiveWindowSize) */
++
++	/* RDPEMT state */
++	BOOL tunnel_created;       /* TRUE after Tunnel Create Request/Response exchange */
++	BYTE expected_cookie[16];  /* securityCookie from TCP Initiate Multitransport Request */
++	BOOL has_expected_cookie;  /* FALSE when the SYN matched no registration */
++
++	/* DTLS */
++	SSL_CTX* dtls_ctx;
++	SSL* dtls;
++	BIO* dtls_rbio;  /* read: we write received UDP data here */
++	BIO* dtls_wbio;  /* write: DTLS writes outgoing data here */
++
++	/* Callback */
++	RdpeudpConnectedCb connected_cb;
++	BOOL saw_client_data;
++	void* userdata;
++
++	/* Event for signaling data availability */
++	HANDLE event;
++
++	/* Keepalive */
++	UINT64 last_keepalive_sent;  /* monotonic ms, server→client keepalive */
++
++	/* When the SYN arrived, so a connection that never becomes one can go. */
++	UINT64 created_at_ms;
++
++	/*
++	 * The session above has been given this pointer. Reaping it would leave
++	 * that pointer dangling, so from here on it is only ever freed when the
++	 * session itself goes.
++	 */
++	BOOL handed_to_app;
++
++	/*
++	 * A chunk read out of the write BIO that could not be sent yet.
++	 *
++	 * It cannot go back into the BIO: BIO_s_mem is a queue, so writing it back
++	 * puts it behind whatever was already there and the peer -- which
++	 * reassembles strictly by sequence number -- gets the TLS stream out of
++	 * order, which is not recoverable. Hold it here and send it first.
++	 */
++	BYTE pending_chunk[2048];
++	size_t pending_chunk_len;
++
++	/* Retransmit buffer for v1 reliable transport */
++	struct {
++		BYTE pkt[RDPEUDP_RETRANSMIT_PKT_MAX]; /* header + TLS payload */
++		UINT16 pkt_len;
++		UINT64 send_time_ms;  /* time of last (re)transmission */
++		BOOL in_use;
++		BOOL retransmitted;   /* an ack for this cannot be timed (Karn) */
++	} retransmit_buf[2048];
++	#define RETRANSMIT_RTO_MS 200  /* retransmit timeout before any RTT sample */
++	#define RETRANSMIT_RTO_MIN_MS 60
++	#define RETRANSMIT_RTO_MAX_MS 3000
++	/* Timeouts with nothing acknowledged before the peer is declared gone. */
++	#define RETRANSMIT_MAX_BACKOFF 8
++	/* RDPUDP_FEC_HEADER(8) + SYNDATA(8) + SYNDATAEX(4) */
++	#define RDPEUDP_SYNACK_MIN_SIZE 20
++	/*
++	 * Bounds for the MTU a peer may propose. The floor leaves room for the v1
++	 * header, the TLS record overhead and a usable payload; the ceiling keeps
++	 * a packet inside the buffers that assemble it.
++	 */
++	#define RDPEUDP_MTU_MIN 576
++	#define RDPEUDP_MTU_MAX 1500
++	/* Anyone can cause one of these to exist, so the table is small and the
++	 * unestablished ones are aged out. */
++	#define RDPEUDP_MAX_CONNECTIONS 64
++	#define RDPEUDP_UNESTABLISHED_TIMEOUT_MS 30000
++	#define CONGESTION_WINDOW_INITIAL 10   /* RFC 6928 initial window */
++	#define CONGESTION_WINDOW_MIN 2
++	/*
++	 * A ceiling on packets in flight. Slow start is exponential and, with no
++	 * threshold set until the first loss is detected, nothing stopped it: an
++	 * hour of clean acknowledgements took the window past twenty thousand
++	 * packets, which is twenty-five megabytes offered to a link that could not
++	 * take it and to a socket buffer that certainly could not hold it.
++	 *
++	 * 256 packets at the tunnel MTU is about 300 KB in flight -- comfortably
++	 * more than the bandwidth-delay product of any link this transport is for,
++	 * and far below what makes the send buffer overflow.
++	 */
++	#define CONGESTION_WINDOW_MAX 256
++
++	/* Round-trip estimate, in the form RFC 6298 uses: a smoothed average and a
++	 * variation term, from which the retransmit timeout is derived. A fixed
++	 * timeout either gives up too early on a slow link or waits far too long on
++	 * a fast one, and this transport exists for links that are neither. */
++	UINT32 srtt_ms;
++	UINT32 rttvar_ms;
++	UINT32 rto_ms;
++
++	/* Congestion window, in packets. The receiver's advertised window says what
++	 * it can hold; this says what the path between us can carry, which is the
++	 * quantity that actually causes loss. Sending is bounded by whichever is
++	 * smaller. */
++	UINT32 cwnd;
++	UINT32 ssthresh;
++	UINT32 cwnd_acked;        /* packets acked in the current congestion window */
++	/* Consecutive timeouts with nothing acknowledged, for RFC 6298 backoff. */
++	UINT32 rto_backoff;
++	UINT64 last_loss_time_ms; /* to back off once per window, not once per packet */
++
++	/* Message queue for incoming DVC PDUs (one per RDPEMT Tunnel Data) */
++	struct {
++		BYTE *data;     /* dynamically allocated */
++		UINT32 len;
++	} recv_msgs[256];
++	UINT16 recv_msg_head;   /* next to read */
++	UINT16 recv_msg_tail;   /* next to write */
++	UINT16 recv_msg_count;  /* messages in queue */
++};
++
++/* Server: manages UDP socket and connections */
++struct rdp_rdpeudp_server
++{
++	int sockfd;
++	int port;
++
++	/* Pending cookie registrations */
++	RdpeudpPendingCookie pending[32];
++	int n_pending;
++	/*
++	 * Guards pending[] and n_pending. Cookies are registered from the peer
++	 * thread while this file's own timer expires them and its SYN handling
++	 * reads them -- a plain n_pending++ racing a memmove, with a sixteen-byte
++	 * memcpy in between.
++	 */
++	CRITICAL_SECTION pending_lock;
++
++	/* Active connections (indexed by peer address) */
++	rdpRdpeudpConn* connections[64];
++	int n_connections;
++
++	/* SSL context for DTLS (shared) */
++	SSL_CTX* dtls_ctx;
++
++	/* Receive buffer for datagrams */
++	BYTE dgram_buf[2048];
++};
++
++/* ============================================================
++ * Utility
++ * ============================================================ */
++
++static UINT16 rdpeudp_clamp_mtu(UINT16 proposed)
++{
++	if (proposed < RDPEUDP_MTU_MIN)
++		return (proposed == 0) ? RDPEUDP_MTU_DEFAULT : RDPEUDP_MTU_MIN;
++	if (proposed > RDPEUDP_MTU_MAX)
++		return RDPEUDP_MTU_MAX;
++	return proposed;
++}
++
++static UINT64 rdpeudp_monotonic_ms(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (UINT64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++/*
++ * What actually crosses the tunnel, in both directions. The framing the client
++ * expects is not written down anywhere we can consult, but the client tells us
++ * itself every time it answers: whatever it sends back is the shape it reads.
++ */
++static void rdpemt_trace_payload(const char* direction, const BYTE* data, size_t len)
++{
++	char hex[3 * 48 + 1];
++	size_t n = (len < 48) ? len : 48;
++
++	/* Formatting is not free and this runs per tunnel PDU in both directions. */
++	if (!WLog_IsLevelActive(WLog_Get(TAG), WLOG_DEBUG))
++		return;
++
++	for (size_t i = 0; i < n; i++)
++		snprintf(&hex[i * 3], 4, "%02X ", data[i]);
++	hex[n * 3] = '\0';
++
++	WLog_DBG(TAG, "RDPEMT %s %zu bytes: %s", direction, len, hex);
++}
++
++static BOOL rdpeudp_addr_equal(const struct sockaddr_storage* a, socklen_t alen,
++                               const struct sockaddr_storage* b, socklen_t blen)
++{
++	if (alen != blen)
++		return FALSE;
++	if (a->ss_family != b->ss_family)
++		return FALSE;
++	if (a->ss_family == AF_INET)
++	{
++		const struct sockaddr_in* a4 = (const struct sockaddr_in*)a;
++		const struct sockaddr_in* b4 = (const struct sockaddr_in*)b;
++		return a4->sin_port == b4->sin_port &&
++		       a4->sin_addr.s_addr == b4->sin_addr.s_addr;
++	}
++	else if (a->ss_family == AF_INET6)
++	{
++		const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)a;
++		const struct sockaddr_in6* b6 = (const struct sockaddr_in6*)b;
++		return a6->sin6_port == b6->sin6_port &&
++		       memcmp(&a6->sin6_addr, &b6->sin6_addr, 16) == 0;
++	}
++	return FALSE;
++}
++
++/* Compare addresses ignoring port (for NAT rebinding tolerance) */
++static BOOL rdpeudp_addr_ip_equal(const struct sockaddr_storage* a, socklen_t alen,
++                                   const struct sockaddr_storage* b, socklen_t blen)
++{
++	if (alen != blen)
++		return FALSE;
++	if (a->ss_family != b->ss_family)
++		return FALSE;
++	if (a->ss_family == AF_INET)
++	{
++		const struct sockaddr_in* a4 = (const struct sockaddr_in*)a;
++		const struct sockaddr_in* b4 = (const struct sockaddr_in*)b;
++		return a4->sin_addr.s_addr == b4->sin_addr.s_addr;
++	}
++	else if (a->ss_family == AF_INET6)
++	{
++		const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)a;
++		const struct sockaddr_in6* b6 = (const struct sockaddr_in6*)b;
++		return memcmp(&a6->sin6_addr, &b6->sin6_addr, 16) == 0;
++	}
++	return FALSE;
++}
++
++/*
++ * A record from the claimed address decrypted under this session's keys, which
++ * no one but the peer can arrange. Adopt the address.
++ */
++static void rdpeudp_conn_confirm_rebind(rdpRdpeudpConn* conn,
++                                        const struct sockaddr_storage* from,
++                                        socklen_t from_len)
++{
++	if (!conn->rebind_pending)
++		return;
++
++	/*
++	 * Only the datagram that actually carried the record can confirm the claim.
++	 * Confirming on any decrypting record meant the legitimate client's own
++	 * traffic completed a stranger's rebind: the stranger proposed an address
++	 * with one unauthenticated header, said nothing more, and the victim's next
++	 * packet handed the session's output to them.
++	 */
++	if (!from || !rdpeudp_addr_equal(&conn->rebind_addr, conn->rebind_addr_len,
++	                                 from, from_len))
++	{
++		/* A record from somewhere else answers the claim too: the peer is
++		 * evidently still where it was, so the claim is stale. Leaving it armed
++		 * let a stranger propose an address once and wait for the real client's
++		 * next packet to complete it. */
++		conn->rebind_pending = FALSE;
++		return;
++	}
++
++	conn->rebind_pending = FALSE;
++
++	if (rdpeudp_addr_equal(&conn->peer_addr, conn->peer_addr_len,
++	                       &conn->rebind_addr, conn->rebind_addr_len))
++		return;
++
++	WLog_INFO(TAG, "Peer address change confirmed by an authenticated record");
++	memcpy(&conn->peer_addr, &conn->rebind_addr, conn->rebind_addr_len);
++	conn->peer_addr_len = conn->rebind_addr_len;
++}
++
++/* ============================================================
++ * RDPEUDP v1 packet building (for SYN/SYNACK/ACK handshake)
++ * ============================================================ */
++
++/* Build SYN-ACK response packet.
++ * Format: RDPUDP_FEC_HEADER(8) + RDPUDP_SYNDATA_PAYLOAD(8) + RDPUDP_SYNDATAEX_PAYLOAD(4)
++ * Total: 20 bytes header, then padded to downstream_mtu with zeros.
++ * Note: securityCookie is NOT in SYNDATA; it is verified later via MS-RDPEMT.
++ */
++static int rdpeudp_build_synack(rdpRdpeudpConn* conn, BYTE* buf, size_t buflen)
++{
++	WINPR_ASSERT(conn);
++	WINPR_ASSERT(buf);
++
++	/* Pad towards the MTU, but never past what the caller allows: the caller
++	 * bounds this by the size of the SYN, so the reply cannot amplify. */
++	size_t target_len = conn->downstream_mtu;
++	if (target_len < RDPEUDP_SYNACK_MIN_SIZE)
++		target_len = RDPEUDP_SYNACK_MIN_SIZE;
++	if (target_len > buflen)
++		target_len = buflen;
++	if (target_len < RDPEUDP_SYNACK_MIN_SIZE)
++		return -1;
++
++	/* Zero the entire buffer first (padding) */
++	memset(buf, 0, target_len);
++
++	size_t pos = 0;
++
++	/* MS-RDPEUDP uses network byte order (big-endian) for all fields */
++
++	/* RDPUDP_FEC_HEADER (8 bytes) */
++	/* snSourceAck (4 bytes, BE) - ack the client's initial sequence number */
++	buf[pos++] = (BYTE)((conn->sn_initial_recv >> 24) & 0xFF);
++	buf[pos++] = (BYTE)((conn->sn_initial_recv >> 16) & 0xFF);
++	buf[pos++] = (BYTE)((conn->sn_initial_recv >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(conn->sn_initial_recv & 0xFF);
++	/* uReceiveWindowSize (2 bytes, BE) - 64 datagrams */
++	buf[pos++] = 0x00;
++	buf[pos++] = 0x40; /* 64 */
++	/*
++	 * uFlags (2 bytes, BE): SYN | ACK | the bit that says a SYNDATAEX payload
++	 * follows.
++	 *
++	 * Pinned to the literal rather than the constant. The names in the header
++	 * above 0x0080 were a position out of step and have been corrected, but
++	 * this particular value is what a real mstsc has been observed to accept,
++	 * and correcting a name must not silently change what goes on the wire. If
++	 * the spec reading is right this is SYNEX under its new name anyway; if it
++	 * is not, this stays interoperable either way.
++	 */
++	UINT16 flags = RDPUDP_FLAG_SYN | RDPUDP_FLAG_ACK | 0x0800;
++	buf[pos++] = (BYTE)((flags >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(flags & 0xFF);
++
++	/* RDPUDP_SYNDATA_PAYLOAD (8 bytes) */
++	/* snInitialSequenceNumber (4 bytes, BE) */
++	buf[pos++] = (BYTE)((conn->sn_initial_send >> 24) & 0xFF);
++	buf[pos++] = (BYTE)((conn->sn_initial_send >> 16) & 0xFF);
++	buf[pos++] = (BYTE)((conn->sn_initial_send >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(conn->sn_initial_send & 0xFF);
++	/* uUpStreamMtu (2 bytes, BE) */
++	buf[pos++] = (BYTE)((conn->upstream_mtu >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(conn->upstream_mtu & 0xFF);
++	/* uDownStreamMtu (2 bytes, BE) */
++	buf[pos++] = (BYTE)((conn->downstream_mtu >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(conn->downstream_mtu & 0xFF);
++
++	/* RDPUDP_SYNDATAEX_PAYLOAD (4 bytes) */
++	/* uSynExFlags (2 bytes, BE) - 0x0001 to match client */
++	buf[pos++] = 0x00;
++	buf[pos++] = 0x01;
++	/* uUdpVer (2 bytes, BE) -- what was negotiated, which is at most what the
++	 * client offered. Advertising a fixed version here told the client one
++	 * thing while the connection behaved as another. */
++	buf[pos++] = (BYTE)((conn->negotiated_version >> 8) & 0xFF);
++	buf[pos++] = (BYTE)(conn->negotiated_version & 0xFF);
++
++	/* Rest is already zero-padded */
++	return (int)target_len;
++}
++
++/* Parse SYN packet from client.
++ * SYNDATA is 8 bytes (sn, mtu_up, mtu_down) — securityCookie is NOT here.
++ * CORRELATIONID payload (32 bytes) follows if CORRELATIONID flag set.
++ * SYNDATAEX payload (4 bytes) follows if SYNEX flag set.
++ */
++static BOOL rdpeudp_parse_syn(const BYTE* data, size_t len, UINT32* out_sn,
++                              UINT16* out_up_mtu, UINT16* out_down_mtu,
++                              BYTE* out_correlationid, UINT16* out_version,
++                              UINT16* out_flags)
++{
++	/* Minimum: FEC_HEADER(8) + SYNDATA(8) = 16 */
++	if (len < 16)
++		return FALSE;
++
++	size_t pos = 0;
++
++	/* MS-RDPEUDP uses network byte order (big-endian) for all fields */
++
++	/* RDPUDP_FEC_HEADER */
++	UINT32 snSourceAck = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) | ((UINT32)data[pos+2] << 8) | data[pos+3];
++	pos += 4;
++	(void)snSourceAck;
++	UINT16 recvWinSize = ((UINT16)data[pos] << 8) | data[pos+1];
++	pos += 2;
++	(void)recvWinSize;
++	UINT16 flags = ((UINT16)data[pos] << 8) | data[pos+1];
++	pos += 2;
++
++	*out_flags = flags;
++
++	if (!(flags & RDPUDP_FLAG_SYN))
++		return FALSE;
++
++	/* RDPUDP_SYNDATA_PAYLOAD (8 bytes) */
++	*out_sn = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) | ((UINT32)data[pos+2] << 8) | data[pos+3];
++	pos += 4;
++	*out_up_mtu = ((UINT16)data[pos] << 8) | data[pos+1];
++	pos += 2;
++	*out_down_mtu = ((UINT16)data[pos] << 8) | data[pos+1];
++	pos += 2;
++
++	/* RDPUDP_CORRELATIONID_PAYLOAD (optional, 32 bytes: 16 correlationId + 16 reserved) */
++	memset(out_correlationid, 0, 16);
++	if ((flags & RDPUDP_FLAG_CORRELATIONID) && pos + 32 <= len)
++	{
++		memcpy(out_correlationid, &data[pos], 16);
++		pos += 32; /* 16 correlationId + 16 reserved */
++	}
++
++	/* RDPUDP_SYNDATAEX_PAYLOAD (optional, 4 bytes: uSynExFlags + uUdpVer) */
++	*out_version = RDPUDP_VERSION_1;
++	if ((flags & RDPUDP_FLAG_SYNEX) && pos + 4 <= len)
++	{
++		/* uSynExFlags (2 bytes, BE) */
++		pos += 2;
++		/* uUdpVer (2 bytes, BE) */
++		*out_version = ((UINT16)data[pos] << 8) | data[pos+1];
++		pos += 2;
++	}
++
++	return TRUE;
++}
++
++/* ============================================================
++ * DTLS setup
++ * ============================================================ */
++
++static SSL_CTX* rdpeudp_create_dtls_ctx(void)
++{
++	/* Reliable UDP channel uses TLS (not DTLS).
++	 * DTLS is only for lossy channels (SYNLOSSY flag).
++	 */
++	const SSL_METHOD* method = TLS_server_method();
++	if (!method)
++	{
++		WLog_ERR(TAG, "TLS_server_method() failed");
++		return NULL;
++	}
++
++	SSL_CTX* ctx = SSL_CTX_new(method);
++	if (!ctx)
++	{
++		WLog_ERR(TAG, "SSL_CTX_new() failed");
++		return NULL;
++	}
++
++	/* Generate self-signed cert on the fly (same as TLS path) */
++	EVP_PKEY* pkey = EVP_PKEY_new();
++	RSA* rsa = RSA_new();
++	BIGNUM* e = BN_new();
++	BN_set_word(e, RSA_F4);
++	RSA_generate_key_ex(rsa, 2048, e, NULL);
++	EVP_PKEY_assign_RSA(pkey, rsa);
++	BN_free(e);
++
++	X509* cert = X509_new();
++	X509_set_version(cert, 2);
++	ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
++	X509_gmtime_adj(X509_get_notBefore(cert), 0);
++	X509_gmtime_adj(X509_get_notAfter(cert), 365 * 24 * 3600);
++	X509_set_pubkey(cert, pkey);
++	X509_NAME* name = X509_get_subject_name(cert);
++	X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char*)"FreeRDP-RDPEUDP", -1, -1, 0);
++	X509_set_issuer_name(cert, name);
++	X509_sign(cert, pkey, EVP_sha256());
++
++	SSL_CTX_use_certificate(ctx, cert);
++	SSL_CTX_use_PrivateKey(ctx, pkey);
++
++	X509_free(cert);
++	EVP_PKEY_free(pkey);
++
++	/* Allow self-signed */
++	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
++
++	/* Set TLS 1.2 maximum */
++	/*
++	 * 1.2, not 1.0.
++	 *
++	 * The main connection is pinned at 1.2 by FreeRDP's own defaults, and this
++	 * tunnel is meant to be the same server. Asking for a 1.0 floor here was
++	 * saved only by OpenSSL's compiled-in security level refusing SHA1
++	 * signatures -- an unstated property of this build, not a decision.
++	 */
++	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
++	SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
++
++	return ctx;
++}
++
++static BOOL rdpeudp_conn_init_dtls(rdpRdpeudpConn* conn)
++{
++	WINPR_ASSERT(conn);
++
++	conn->dtls_ctx = conn->server->dtls_ctx;
++	conn->dtls = SSL_new(conn->dtls_ctx);
++	if (!conn->dtls)
++	{
++		WLog_ERR(TAG, "SSL_new() failed for TLS over RDPEUDP");
++		return FALSE;
++	}
++
++	/* Memory BIOs for our custom transport */
++	conn->dtls_rbio = BIO_new(BIO_s_mem());
++	conn->dtls_wbio = BIO_new(BIO_s_mem());
++	BIO_set_mem_eof_return(conn->dtls_rbio, -1);
++	BIO_set_mem_eof_return(conn->dtls_wbio, -1);
++	SSL_set_bio(conn->dtls, conn->dtls_rbio, conn->dtls_wbio);
++
++	SSL_set_accept_state(conn->dtls);  /* server mode */
++
++	/* Limit TLS record size so each record + v1 header fits in one UDP packet.
++	 * v1 header = 20 bytes (FEC_HEADER 8 + ACK_VECTOR 4 + SOURCE_PAYLOAD 8)
++	 * TLS 1.2 GCM overhead = ~29 bytes (5 hdr + 8 nonce + 16 tag)
++	 * max_fragment = downstream_mtu - 20 - 29 = available for plaintext */
++	{
++		int v1_overhead = 20;  /* FEC + ACK + SOURCE headers */
++		int tls_overhead = 29; /* TLS 1.2 record header + GCM nonce + tag */
++		int max_frag = (int)conn->downstream_mtu - v1_overhead - tls_overhead;
++		if (max_frag < 256)
++			max_frag = 256;
++		SSL_set_max_send_fragment(conn->dtls, max_frag);
++		WLog_DBG(TAG, "TLS max_send_fragment set to %d (mtu=%u)", max_frag, conn->downstream_mtu);
++	}
++
++	conn->state = RDPEUDP_STATE_DTLS_HANDSHAKE;
++	WLog_DBG(TAG, "TLS over RDPEUDP initialized (reliable channel)");
++	return TRUE;
++}
++
++/* Flush outgoing DTLS data to UDP socket, using v1 DATA framing.
++ * Format: FEC_HEADER(8) + ACK_VECTOR(4) + SOURCE_PAYLOAD_HEADER(8) + payload.
++ * Uses ACK|DATA flags to match MS-RDPEUDP wire format.
++ */
++static void rdpeudp_conn_on_loss(rdpRdpeudpConn* conn, UINT64 now_ms);
++
++static void rdpeudp_conn_flush_dtls_out(rdpRdpeudpConn* conn)
++{
++	BYTE dtls_buf[2048];
++	int pending;
++	UINT64 now = rdpeudp_monotonic_ms();
++
++	/* One datagram per read, and never larger than the peer said it can take.
++	 *
++	 * SSL_set_max_send_fragment bounds a single TLS record, not what the BIO
++	 * hands back: several records queue up there and come out in one read, and
++	 * the whole lot then went into one UDP packet. The peer's MTU was exceeded
++	 * by nearly a kilobyte, over and over, and those datagrams go nowhere.
++	 *
++	 * Splitting anywhere is safe. What travels over v1 DATA is a byte stream
++	 * that the sequence numbers put back in order, so a TLS record straddling
++	 * two packets is reassembled before anything tries to parse it. */
++	const size_t v1_header_size = 8 + 4 + 8;
++	size_t max_payload = (conn->downstream_mtu > v1_header_size)
++	                         ? conn->downstream_mtu - v1_header_size
++	                         : 256;
++
++	if (max_payload > sizeof(dtls_buf))
++		max_payload = sizeof(dtls_buf);
++
++	/*
++	 * And never more than the retransmit buffer can keep. A packet that is sent
++	 * but not filed is one the peer can never ask for again, in a byte stream
++	 * it reassembles strictly in order -- one loss and the tunnel stops.
++	 */
++	if (max_payload + v1_header_size > RDPEUDP_RETRANSMIT_PKT_MAX)
++		max_payload = RDPEUDP_RETRANSMIT_PKT_MAX - v1_header_size;
++
++	for (;;)
++	{
++		/* Whatever was held back last time goes first, or the stream reorders. */
++		if (conn->pending_chunk_len > 0)
++		{
++			pending = (int)conn->pending_chunk_len;
++			memcpy(dtls_buf, conn->pending_chunk, conn->pending_chunk_len);
++		}
++		else
++		{
++			pending = BIO_read(conn->dtls_wbio, dtls_buf, (int)max_payload);
++			if (pending <= 0)
++				break;
++		}
++
++		/*
++		 * Flow control: only send while fewer datagrams are outstanding than
++		 * the peer's window and the congestion window allow.
++		 *
++		 * Outstanding means still unacknowledged, not "anywhere above the
++		 * cumulative acknowledgement". Those differ whenever the peer reports a
++		 * hole: the acknowledgement is held below it so the retransmit scan
++		 * keeps reaching it, and counting the whole span from there would make
++		 * one lost datagram fill the entire window. Nothing new could then go
++		 * out until the hole closed -- which is why a single loss stopped the
++		 * picture for a median of 371 ms and, at the tail, four seconds.
++		 *
++		 * The peer's own acknowledgement vector says which of them arrived, and
++		 * the retransmit buffer already records exactly that: a slot is in use
++		 * only while its datagram is unaccounted for. So count those.
++		 */
++		UINT32 in_flight = conn->unacked_count;
++		UINT32 send_window = conn->peer_recv_window;
++		if (conn->cwnd < send_window)
++			send_window = conn->cwnd;
++		if (in_flight >= send_window)
++		{
++			WLog_DBG(TAG, "Send window full (in_flight=%u >= window=%u, cwnd=%u), "
++			         "holding %d bytes of TLS data",
++			         in_flight, send_window, conn->cwnd, pending);
++			memcpy(conn->pending_chunk, dtls_buf, (size_t)pending);
++			conn->pending_chunk_len = (size_t)pending;
++			break;
++		}
++
++		/* From here the chunk is either sent or held again, so the slot is
++		 * clear; anything that keeps it puts it back explicitly. */
++		conn->pending_chunk_len = 0;
++		/* Build v1 ACK+DATA packet:
++		 * FEC_HEADER(8) + ACK_VECTOR_HEADER(4) + SOURCE_PAYLOAD_HEADER(8) + payload
++		 * TLS record size is limited by SSL_set_max_send_fragment to fit in MTU.
++		 */
++		BYTE pkt[2048 + 20];
++		size_t pos = 0;
++
++		/* RDPUDP_FEC_HEADER (8 bytes, big-endian) */
++		UINT32 snAck = conn->v1_recv_sn;
++		pkt[pos++] = (BYTE)((snAck >> 24) & 0xFF);
++		pkt[pos++] = (BYTE)((snAck >> 16) & 0xFF);
++		pkt[pos++] = (BYTE)((snAck >> 8) & 0xFF);
++		pkt[pos++] = (BYTE)(snAck & 0xFF);
++		/* uReceiveWindowSize (2 bytes, BE) */
++		pkt[pos++] = 0x00;
++		pkt[pos++] = 0x40; /* 64 */
++		/* uFlags (2 bytes, BE) = ACK | DATA */
++		UINT16 flags = RDPUDP_FLAG_ACK | RDPUDP_FLAG_DATA;
++		pkt[pos++] = (BYTE)((flags >> 8) & 0xFF);
++		pkt[pos++] = (BYTE)(flags & 0xFF);
++
++		/* RDPUDP_ACK_VECTOR_HEADER (4 bytes, padded to DWORD) */
++		pkt[pos++] = 0x00;
++		pkt[pos++] = 0x01;
++		pkt[pos++] = 0x00;
++		pkt[pos++] = 0x00;
++
++		/* RDPUDP_SOURCE_PAYLOAD_HEADER (8 bytes, big-endian) */
++		UINT32 sn = conn->v1_send_sn++;
++		pkt[pos++] = (BYTE)((sn >> 24) & 0xFF);
++		pkt[pos++] = (BYTE)((sn >> 16) & 0xFF);
++		pkt[pos++] = (BYTE)((sn >> 8) & 0xFF);
++		pkt[pos++] = (BYTE)(sn & 0xFF);
++		pkt[pos++] = (BYTE)((sn >> 24) & 0xFF);
++		pkt[pos++] = (BYTE)((sn >> 16) & 0xFF);
++		pkt[pos++] = (BYTE)((sn >> 8) & 0xFF);
++		pkt[pos++] = (BYTE)(sn & 0xFF);
++
++		/* Payload (TLS record) */
++		memcpy(&pkt[pos], dtls_buf, pending);
++		size_t total = pos + pending;
++
++		if ((int)total > (int)conn->downstream_mtu)
++			WLog_WARN(TAG, "v1 packet %zu bytes exceeds MTU %u!", total, conn->downstream_mtu);
++
++		WLog_DBG(TAG, "Sending v1 ACK+DATA (sn=%u, ack_sn=%u, tls=%d bytes, total=%zu)",
++		         sn, snAck, pending, total);
++
++		ssize_t sent = sendto(conn->server->sockfd, pkt, total, 0,
++		                      (struct sockaddr*)&conn->peer_addr, conn->peer_addr_len);
++		if (sent < 0)
++		{
++			/*
++			 * The socket is non-blocking, so a full send buffer comes back as
++			 * EAGAIN. This used to be logged and then ignored: the sequence
++			 * number was spent, the packet was filed as sent, and a hole opened
++			 * in a byte stream that the peer reassembles strictly in order.
++			 * Everything behind the hole was undeliverable until a retransmit
++			 * timer happened to fill it, and meanwhile the next packet was
++			 * offered to the same full buffer. The session reported a slow
++			 * network and then stopped.
++			 *
++			 * So put it back exactly as it was -- the bytes into the BIO, the
++			 * sequence number unspent -- and leave. Nothing was sent, and
++			 * nothing should look as though it was.
++			 */
++			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)
++			{
++				conn->v1_send_sn--;
++				memcpy(conn->pending_chunk, dtls_buf, (size_t)pending);
++				conn->pending_chunk_len = (size_t)pending;
++
++				/* A send buffer that will not take another datagram is the
++				 * clearest statement the path can make about its rate. */
++				rdpeudp_conn_on_loss(conn, now);
++
++				WLog_DBG(TAG, "Send buffer full at sn=%u (in_flight=%u, cwnd=%u); "
++				         "holding %d bytes for the next flush",
++				         sn, in_flight, conn->cwnd, pending);
++				break;
++			}
++
++			/* Any other error is not transient, but the packet still did not
++			 * go: file it so the retransmit timer will try again rather than
++			 * leaving a hole the peer waits on for ever. */
++			WLog_ERR(TAG, "sendto() v1 DATA failed: %s", strerror(errno));
++			conn->retransmit_buf[sn % 2048].send_time_ms = 0;
++		}
++
++		/* Save packet in retransmit buffer for reliable delivery */
++		{
++			UINT32 idx = sn % 2048;
++			if (total <= sizeof(conn->retransmit_buf[idx].pkt))
++			{
++				/* Taking a slot that is still spoken for would lose the
++				 * datagram already in it and leave the count describing a
++				 * buffer that no longer exists. The window is bounded well
++				 * below the buffer, so this does not happen -- say so if it
++				 * ever does rather than quietly miscounting. */
++				if (conn->retransmit_buf[idx].in_use)
++				{
++					WLog_WARN(TAG, "retransmit slot for sn=%u was still in use; "
++					               "%u outstanding, window %u",
++					          sn, conn->unacked_count, send_window);
++				}
++				else
++				{
++					conn->unacked_count++;
++				}
++
++				memcpy(conn->retransmit_buf[idx].pkt, pkt, total);
++				conn->retransmit_buf[idx].pkt_len = (UINT16)total;
++				conn->retransmit_buf[idx].send_time_ms = now;
++				conn->retransmit_buf[idx].in_use = TRUE;
++			}
++		}
++	}
++}
++
++/*
++ * Congestion control, RFC 5681 in shape: grow the window while packets get
++ * through, halve it when one does not.
++ *
++ * The receiver's advertised window only says what it is willing to hold. It
++ * says nothing about the path in between, which is where loss actually
++ * happens -- and a transport chosen for lossy links that ignores loss will
++ * simply keep pushing until the link collapses.
++ */
++static void rdpeudp_conn_init_congestion(rdpRdpeudpConn* conn)
++{
++	conn->cwnd = CONGESTION_WINDOW_INITIAL;
++	conn->ssthresh = 0xFFFFFFFF; /* no threshold until the first loss */
++	conn->cwnd_acked = 0;
++	conn->rto_backoff = 0;
++	conn->rto_ms = RETRANSMIT_RTO_MS;
++	conn->srtt_ms = 0;
++	conn->rttvar_ms = 0;
++	conn->last_loss_time_ms = 0;
++}
++
++/* RFC 6298: smooth the round-trip estimate and derive the timeout from it. */
++static void rdpeudp_conn_update_rtt(rdpRdpeudpConn* conn, UINT32 sample_ms)
++{
++	if (sample_ms == 0)
++		sample_ms = 1;
++
++	if (conn->srtt_ms == 0)
++	{
++		conn->srtt_ms = sample_ms;
++		conn->rttvar_ms = sample_ms / 2;
++	}
++	else
++	{
++		const UINT32 delta = (sample_ms > conn->srtt_ms) ? sample_ms - conn->srtt_ms
++		                                                 : conn->srtt_ms - sample_ms;
++		conn->rttvar_ms = (3 * conn->rttvar_ms + delta) / 4;
++		conn->srtt_ms = (7 * conn->srtt_ms + sample_ms) / 8;
++	}
++
++	/*
++	 * The backoff is not cleared here. A sample can be taken from a datagram
++	 * acknowledged past a hole, which says the path is alive but says nothing
++	 * about whether the hole can be repaired; clearing the counter on that
++	 * would leave a tunnel resending an unfillable gap for ever. It is cleared
++	 * where the cumulative acknowledgement actually advances.
++	 */
++	conn->rto_ms = conn->srtt_ms + 4 * conn->rttvar_ms;
++	if (conn->rto_ms < RETRANSMIT_RTO_MIN_MS)
++		conn->rto_ms = RETRANSMIT_RTO_MIN_MS;
++	if (conn->rto_ms > RETRANSMIT_RTO_MAX_MS)
++		conn->rto_ms = RETRANSMIT_RTO_MAX_MS;
++}
++
++/*
++ * Packets arrived: open up. Exponentially below the threshold, so a new or
++ * recovered connection finds the available rate quickly; one packet per window
++ * above it, so a settled connection probes for more without provoking loss.
++ */
++static void rdpeudp_conn_on_ack(rdpRdpeudpConn* conn, UINT32 acked)
++{
++	if (acked == 0)
++		return;
++
++	if (conn->cwnd < conn->ssthresh)
++	{
++		conn->cwnd += acked;
++		if (conn->cwnd > conn->ssthresh)
++			conn->cwnd = conn->ssthresh;
++	}
++	else
++	{
++		conn->cwnd_acked += acked;
++		if (conn->cwnd_acked >= conn->cwnd)
++		{
++			conn->cwnd_acked = 0;
++			conn->cwnd++;
++		}
++	}
++
++	if (conn->cwnd > CONGESTION_WINDOW_MAX)
++		conn->cwnd = CONGESTION_WINDOW_MAX;
++}
++
++/*
++ * A packet was lost: halve the window and remember the rate that provoked it.
++ *
++ * Backing off once per round trip rather than once per lost packet matters --
++ * loss arrives in bursts, and treating each one separately would collapse the
++ * window to nothing over a single bad moment.
++ */
++static void rdpeudp_conn_on_loss(rdpRdpeudpConn* conn, UINT64 now_ms)
++{
++	const UINT32 backoff_window = (conn->srtt_ms > 0) ? conn->srtt_ms : RETRANSMIT_RTO_MS;
++
++	if (conn->last_loss_time_ms != 0 && now_ms - conn->last_loss_time_ms < backoff_window)
++		return;
++
++	conn->last_loss_time_ms = now_ms;
++	conn->ssthresh = conn->cwnd / 2;
++	if (conn->ssthresh < CONGESTION_WINDOW_MIN)
++		conn->ssthresh = CONGESTION_WINDOW_MIN;
++	conn->cwnd = conn->ssthresh;
++	conn->cwnd_acked = 0;
++
++	WLog_DBG(TAG, "loss: cwnd now %u, ssthresh %u, rto %u ms", conn->cwnd, conn->ssthresh,
++	         conn->rto_ms);
++}
++
++/* Check for and retransmit unacknowledged v1 packets */
++static void rdpeudp_conn_retransmit_check(rdpRdpeudpConn* conn)
++{
++	if (conn->state != RDPEUDP_STATE_CONNECTED)
++		return;
++
++	UINT64 now = rdpeudp_monotonic_ms();
++	UINT32 in_flight = conn->unacked_count;
++
++	/*
++	 * Say so when the stream stops moving.
++	 *
++	 * This runs on the keepalive timer, so it is the one place that is reached
++	 * whether or not anything is arriving. A tunnel that has stopped used to
++	 * be entirely silent -- the session three layers up saw the graphics
++	 * channel go quiet and had to be read backwards from there. One line, once,
++	 * with the numbers that say which end is stuck.
++	 */
++	if (conn->recv_stalled_since_ms != 0 && !conn->recv_stall_reported &&
++	    now - conn->recv_stalled_since_ms > 5000)
++	{
++		UINT32 held = 0;
++
++		for (UINT32 i = 0; i < RDPEUDP_REORDER_WINDOW; i++)
++		{
++			if (conn->reorder_buf[i].in_use)
++				held++;
++		}
++
++		WLog_WARN(TAG, "the stream has been waiting %" PRIu64 " ms for sn=%u "
++		               "(highest seen %u, %u packets held behind it, %u of ours "
++		               "unacknowledged, cwnd=%u, rto=%u ms)",
++		          now - conn->recv_stalled_since_ms, conn->v1_recv_next,
++		          conn->v1_recv_sn_highest, held, in_flight, conn->cwnd,
++		          conn->rto_ms);
++		conn->recv_stall_reported = TRUE;
++	}
++
++	/*
++	 * A hole that is still open after this long is not being repaired. Say so
++	 * while it is happening rather than leaving it to be read backwards out of
++	 * the give-up three minutes later.
++	 */
++	if (conn->ack_gap_pending && !conn->ack_gap_slow_reported &&
++	    now - conn->ack_gap_started_ms > ACK_GAP_SLOW_MS)
++	{
++		conn->ack_gap_slow_reported = TRUE;
++		WLog_WARN(TAG, "a hole the peer reported %" PRIu64 " ms ago is still not "
++		               "filled; holding the acknowledgement at %u with %u of ours "
++		               "unacknowledged (cwnd=%u, rto=%u ms)",
++		          now - conn->ack_gap_started_ms, conn->v1_acked_sn, in_flight,
++		          conn->cwnd, conn->rto_ms);
++	}
++
++	/* What the loss on this link has added up to, at a rate a log can carry. */
++	if (conn->ack_gap_summary_due_ms != 0 && now >= conn->ack_gap_summary_due_ms)
++	{
++		if (conn->ack_gap_episodes > 0)
++		{
++			WLog_INFO(TAG, "the peer reported %u hole(s) totalling %u datagram(s) "
++			               "in the last %u s; the slowest one that closed took "
++			               "%" PRIu64 " ms",
++			          conn->ack_gap_episodes, conn->ack_gap_datagrams,
++			          ACK_GAP_SUMMARY_INTERVAL_MS / 1000, conn->ack_gap_worst_ms);
++		}
++		conn->ack_gap_episodes = 0;
++		conn->ack_gap_datagrams = 0;
++		conn->ack_gap_worst_ms = 0;
++		conn->ack_gap_summary_due_ms = now + ACK_GAP_SUMMARY_INTERVAL_MS;
++	}
++
++	if (in_flight == 0)
++		return;
++	UINT32 retransmitted = 0;
++	UINT32 effective_rto;
++
++	/*
++	 * RFC 6298 5.5: back off after each timeout that produces no
++	 * acknowledgement, and stop eventually. Without either, a peer that simply
++	 * stops answering had up to a full window resent every sixty milliseconds
++	 * for the life of the process -- tens of megabits a second aimed at
++	 * whatever address the connection held, from an attacker who sends nothing
++	 * at all.
++	 */
++	effective_rto = conn->rto_ms << ((conn->rto_backoff > 6) ? 6 : conn->rto_backoff);
++	if (effective_rto > RETRANSMIT_RTO_MAX_MS)
++		effective_rto = RETRANSMIT_RTO_MAX_MS;
++
++	if (conn->rto_backoff >= RETRANSMIT_MAX_BACKOFF)
++	{
++		if (!conn->retransmit_given_up)
++		{
++			conn->retransmit_given_up = TRUE;
++			WLog_WARN(TAG, "Nothing acknowledged after %u retransmission "
++			               "timeouts; no longer retransmitting, and sending "
++			               "over TCP instead. The connection stays open so the "
++			               "peer's own sends keep working.",
++			          conn->rto_backoff);
++		}
++		return;
++	}
++
++	/* Iterate over all unacked packets (from oldest to newest) */
++	for (UINT32 sn = conn->v1_acked_sn + 1; sn != conn->v1_send_sn; sn++)
++	{
++		UINT32 idx = sn % 2048;
++		if (!conn->retransmit_buf[idx].in_use)
++			continue;
++
++		UINT64 age = now - conn->retransmit_buf[idx].send_time_ms;
++		if (age < effective_rto)
++			continue;  /* Not old enough to retransmit */
++
++		/* Anything unacknowledged past the timeout is treated as lost, which
++		 * is what tells the congestion window to back off. */
++		rdpeudp_conn_on_loss(conn, now);
++		conn->retransmit_buf[idx].retransmitted = TRUE;
++
++		/* Retransmit this packet */
++		ssize_t sent = sendto(conn->server->sockfd,
++		                      conn->retransmit_buf[idx].pkt,
++		                      conn->retransmit_buf[idx].pkt_len, 0,
++		                      (struct sockaddr*)&conn->peer_addr, conn->peer_addr_len);
++		if (sent < 0)
++		{
++			/* Resetting the timer on a send that did not happen would push the
++			 * next attempt out by another whole timeout, on the one packet the
++			 * peer is currently blocked behind. Leave the timer where it is and
++			 * stop: the buffer is full, and the packets after this one are not
++			 * going to fare better. */
++			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)
++			{
++				WLog_DBG(TAG, "retransmit of sn=%u deferred: send buffer full", sn);
++				break;
++			}
++
++			WLog_ERR(TAG, "retransmit sendto() sn=%u failed: %s", sn, strerror(errno));
++		}
++
++		conn->retransmit_buf[idx].send_time_ms = now;  /* Reset timer */
++		retransmitted++;
++
++		/* Limit retransmissions per call to avoid burst */
++		if (retransmitted >= 16)
++			break;
++	}
++
++	if (retransmitted > 0)
++	{
++		/* A pass that answers the peer's report of a hole is not a timeout, so
++		 * it does not back anything off. The next one, if this is lost, is. */
++		if (conn->fast_retransmit_pending)
++			conn->fast_retransmit_pending = FALSE;
++		else
++			++conn->rto_backoff;
++
++		WLog_DBG(TAG, "Retransmitted %u packets (unacked: sn %u..%u, acked=%u)",
++		         retransmitted, conn->v1_acked_sn + 1, conn->v1_send_sn - 1,
++		         conn->v1_acked_sn);
++	}
++}
++
++/* Drive TLS handshake over RDPEUDP. Returns TRUE when handshake is complete. */
++static BOOL rdpeudp_conn_drive_dtls(rdpRdpeudpConn* conn)
++{
++	int ret = SSL_do_handshake(conn->dtls);
++
++	WLog_DBG(TAG, "SSL_do_handshake returned %d, SSL_state=%s",
++	          ret, SSL_state_string_long(conn->dtls));
++
++	rdpeudp_conn_flush_dtls_out(conn);
++
++	if (ret == 1)
++	{
++		/* Handshake complete! */
++		conn->state = RDPEUDP_STATE_CONNECTED;
++
++		/* Re-apply max_send_fragment after handshake completes.
++		 * v1 header = 20 bytes, TLS 1.2 GCM overhead ~29 bytes. */
++		{
++			int v1_overhead = 20;
++			int tls_overhead = 29;
++			int max_frag = (int)conn->downstream_mtu - v1_overhead - tls_overhead;
++			if (max_frag < 256)
++				max_frag = 256;
++			long rc = SSL_set_max_send_fragment(conn->dtls, max_frag);
++			WLog_DBG(TAG, "TLS max_send_fragment=%d after handshake (rc=%ld, mtu=%u)",
++			          max_frag, rc, conn->downstream_mtu);
++		}
++
++		WLog_INFO(TAG, "TLS handshake over RDPEUDP complete (version=%s cipher=%s)",
++		          SSL_get_version(conn->dtls), SSL_get_cipher_name(conn->dtls));
++		return TRUE;
++	}
++
++	int err = SSL_get_error(conn->dtls, ret);
++	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
++		return FALSE; /* continue later */
++
++	char errbuf[256];
++	ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
++	WLog_ERR(TAG, "DTLS handshake failed: %s", errbuf);
++	conn->state = RDPEUDP_STATE_CLOSED;
++	return FALSE;
++}
++
++/*
++ * Where an arriving source packet belongs.
++ *
++ * Kept apart from the connection so the rule can be stated once and tested:
++ * the payloads form a byte stream that is reassembled in order, so the only
++ * question is whether this packet is the next one, one to hold, or one already
++ * accounted for.
++ */
++typedef enum
++{
++	RDPEUDP_RECV_DELIVER,   /* the next one: hand it over, then drain what follows */
++	RDPEUDP_RECV_BUFFER,    /* ahead of the next one, within the window: hold it */
++	RDPEUDP_RECV_DUPLICATE, /* delivered already, or already held */
++	RDPEUDP_RECV_TOO_FAR,   /* so far ahead it cannot be genuine */
++} RdpeudpRecvDisposition;
++
++static RdpeudpRecvDisposition rdpeudp_recv_classify(UINT32 sn, UINT32 next, BOOL already_held)
++{
++	/*
++	 * Signed difference, so this keeps working across a wrap of the sequence
++	 * space rather than declaring every packet after it a duplicate.
++	 */
++	const INT32 ahead = (INT32)(sn - next);
++
++	if (ahead < 0)
++		return RDPEUDP_RECV_DUPLICATE;
++
++	if ((UINT32)ahead >= RDPEUDP_REORDER_WINDOW)
++		return RDPEUDP_RECV_TOO_FAR;
++
++	if (ahead == 0)
++		return RDPEUDP_RECV_DELIVER;
++
++	return already_held ? RDPEUDP_RECV_DUPLICATE : RDPEUDP_RECV_BUFFER;
++}
++
++/*
++ * Put a payload into the stream, in sequence.
++ *
++ * Either this is the packet the stream is waiting for -- in which case it goes
++ * across, and so does everything that arrived early behind it -- or it waits
++ * its turn here. Returns TRUE if anything reached the stream, which is what
++ * tells the caller there may be something to read out of TLS.
++ */
++static BOOL rdpeudp_conn_deliver_in_order(rdpRdpeudpConn* conn, UINT32 sn,
++                                          const BYTE* payload, size_t len,
++                                          RdpeudpRecvDisposition disposition)
++{
++	if (disposition == RDPEUDP_RECV_BUFFER)
++	{
++		const UINT32 slot = sn % RDPEUDP_REORDER_WINDOW;
++
++		if (len > sizeof(conn->reorder_buf[slot].data))
++		{
++			WLog_WARN(TAG, "v1_data: sn=%u carries %zu bytes, more than a "
++			               "source packet may; dropping",
++			          sn, len);
++			return FALSE;
++		}
++
++		memcpy(conn->reorder_buf[slot].data, payload, len);
++		conn->reorder_buf[slot].len = (UINT16)len;
++		conn->reorder_buf[slot].in_use = TRUE;
++		WLog_DBG(TAG, "v1_data: holding sn=%u, waiting for %u", sn,
++		         conn->v1_recv_next);
++
++		if (conn->recv_stalled_since_ms == 0)
++			conn->recv_stalled_since_ms = rdpeudp_monotonic_ms();
++
++		return FALSE;
++	}
++
++	BIO_write(conn->dtls_rbio, payload, (int)len);
++	conn->v1_recv_next = sn + 1;
++	conn->recv_stalled_since_ms = 0;
++	conn->recv_stall_reported = FALSE;
++
++	for (;;)
++	{
++		const UINT32 slot = conn->v1_recv_next % RDPEUDP_REORDER_WINDOW;
++
++		if (!conn->reorder_buf[slot].in_use)
++			break;
++
++		BIO_write(conn->dtls_rbio, conn->reorder_buf[slot].data,
++		          (int)conn->reorder_buf[slot].len);
++		conn->reorder_buf[slot].in_use = FALSE;
++		WLog_DBG(TAG, "v1_data: released held sn=%u", conn->v1_recv_next);
++		conn->v1_recv_next++;
++	}
++
++	return TRUE;
++}
++
++static void rdpeudp_recv_seen_set(rdpRdpeudpConn* conn, UINT32 sn)
++{
++	const UINT32 bit = sn % RDPEUDP_RECV_HISTORY;
++
++	conn->recv_seen[bit / 8] |= (BYTE)(1u << (bit % 8));
++}
++
++static void rdpeudp_recv_seen_clear(rdpRdpeudpConn* conn, UINT32 sn)
++{
++	const UINT32 bit = sn % RDPEUDP_RECV_HISTORY;
++
++	conn->recv_seen[bit / 8] &= (BYTE)~(1u << (bit % 8));
++}
++
++static BOOL rdpeudp_recv_seen(rdpRdpeudpConn* conn, UINT32 sn)
++{
++	const UINT32 bit = sn % RDPEUDP_RECV_HISTORY;
++
++	return (conn->recv_seen[bit / 8] & (BYTE)(1u << (bit % 8))) != 0;
++}
++
++/* Send a v1 ACK-only packet (no data) to acknowledge received packets */
++static void rdpeudp_conn_send_ack(rdpRdpeudpConn* conn)
++{
++	BYTE pkt[64];
++	size_t pos = 0;
++
++	UINT32 snAck = conn->v1_recv_sn;
++	pkt[pos++] = (BYTE)((snAck >> 24) & 0xFF);
++	pkt[pos++] = (BYTE)((snAck >> 16) & 0xFF);
++	pkt[pos++] = (BYTE)((snAck >> 8) & 0xFF);
++	pkt[pos++] = (BYTE)(snAck & 0xFF);
++	pkt[pos++] = 0x04;
++	pkt[pos++] = 0x00; /* window=1024 (0x0400 BE) */
++	UINT16 flags = RDPUDP_FLAG_ACK;
++	pkt[pos++] = (BYTE)((flags >> 8) & 0xFF);
++	pkt[pos++] = (BYTE)(flags & 0xFF);
++
++	/*
++	 * Build the acknowledgement vector from what actually arrived.
++	 *
++	 * Each element is a two-bit state and a six-bit run length, newest first,
++	 * so consecutive datagrams in the same state collapse into one element.
++	 * State 0 is RECEIVED and state 3 is PENDING -- which is how a gap is said.
++	 */
++	BYTE ack_vec[32];
++	UINT16 vec_size = 0;
++	UINT32 described = 0;
++	UINT32 history = conn->v1_recv_sn - conn->sn_initial_recv;
++
++	if (history > RDPEUDP_RECV_HISTORY)
++		history = RDPEUDP_RECV_HISTORY;
++
++	while (described < history && vec_size < 32)
++	{
++		const UINT32 sn = conn->v1_recv_sn - described;
++		const BOOL state_received = conn->v1_recv_sn_valid ? rdpeudp_recv_seen(conn, sn) : TRUE;
++		UINT32 run = 0;
++
++		while (described + run < history && run < 64)
++		{
++			const UINT32 next = conn->v1_recv_sn - (described + run);
++
++			if ((conn->v1_recv_sn_valid ? rdpeudp_recv_seen(conn, next) : TRUE) != state_received)
++				break;
++			run++;
++		}
++
++		ack_vec[vec_size++] =
++		    (BYTE)((state_received ? RDPUDP_VECTOR_RECEIVED
++		                           : RDPUDP_VECTOR_NOT_YET_RECEIVED) << 6) |
++		    (BYTE)(run - 1);
++		described += run;
++	}
++
++	if (vec_size == 0)
++	{
++		ack_vec[0] = 0x00; /* RECEIVED, count=0 -> 1 datagram */
++		vec_size = 1;
++	}
++
++	/* uAckVectorSize (2 bytes BE) */
++	pkt[pos++] = (BYTE)((vec_size >> 8) & 0xFF);
++	pkt[pos++] = (BYTE)(vec_size & 0xFF);
++	/* AckVectorElement array */
++	memcpy(&pkt[pos], ack_vec, vec_size);
++	pos += vec_size;
++	/* Pad to DWORD boundary */
++	size_t ack_total = 2 + vec_size;
++	size_t pad = (4 - (ack_total % 4)) % 4;
++	memset(&pkt[pos], 0, pad);
++	pos += pad;
++
++	sendto(conn->server->sockfd, pkt, pos, 0,
++	       (struct sockaddr*)&conn->peer_addr, conn->peer_addr_len);
++}
++
++/*
++ * What the peer's acknowledgement vector says never arrived.
++ *
++ * The elements run newest first: the first describes the datagram named by
++ * snSourceAck, and each one after it the run immediately before, up to 64
++ * datagrams each. Anything older than the vector reaches is not described at
++ * all and is taken as received -- the peer has stopped talking about it.
++ *
++ * This is the reading half of what the send side already does with recv_seen.
++ * mstsc advances snSourceAck straight past datagrams it never received and
++ * reports them here and nowhere else, so a server that reads only the number
++ * retires exactly the datagrams that need resending.
++ */
++static UINT32 rdpeudp_ack_vector_gaps(const BYTE* vec, UINT16 vec_len, UINT32 ack,
++                                      RdpeudpSeqRange* gaps)
++{
++	UINT32 n = 0;
++	UINT32 cur = ack;
++
++	for (UINT16 i = 0; i < vec_len; i++)
++	{
++		const UINT32 run = (UINT32)(vec[i] & 0x3F) + 1;
++		const UINT32 lo = cur - run + 1;
++
++		if ((vec[i] >> 6) == RDPUDP_VECTOR_NOT_YET_RECEIVED)
++		{
++			if (n >= RDPEUDP_MAX_REPORTED_GAPS)
++				break;
++			gaps[n].lo = lo;
++			gaps[n].hi = cur;
++			n++;
++		}
++
++		cur = lo - 1;
++	}
++
++	return n;
++}
++
++static BOOL rdpeudp_seq_in_ranges(const RdpeudpSeqRange* ranges, UINT32 n, UINT32 sn)
++{
++	for (UINT32 i = 0; i < n; i++)
++	{
++		if ((INT32)(sn - ranges[i].lo) >= 0 && (INT32)(ranges[i].hi - sn) >= 0)
++			return TRUE;
++	}
++
++	return FALSE;
++}
++
++/* Handle v1 DATA packet (ACK+DATA flags set).
++ * Parses: FEC_HEADER(8) → ACK_VECTOR(variable) → [ACK_OF_ACKVECTOR(4)] → SOURCE_PAYLOAD_HEADER(8) → DTLS payload.
++ * Feeds DTLS payload to BIO and drives DTLS handshake/data.
++ */
++static void rdpeudp_conn_handle_v1_data(rdpRdpeudpConn* conn,
++                                         const BYTE* data, size_t len,
++                                         const struct sockaddr_storage* from,
++                                         socklen_t from_len)
++{
++	if (len < 8)
++		return;
++
++	/* Parse FEC header — extract snSourceAck and uReceiveWindowSize for flow control */
++	UINT32 snSourceAck = ((UINT32)data[0] << 24) | ((UINT32)data[1] << 16) |
++	                     ((UINT32)data[2] << 8) | data[3];
++	UINT16 recvWinSize = ((UINT16)data[4] << 8) | data[5];
++	UINT16 flags = ((UINT16)data[6] << 8) | data[7];
++	size_t pos = 8; /* past FEC_HEADER */
++	const BYTE* ack_vector = NULL;
++	UINT16 ack_vector_len = 0;
++
++	/*
++	 * The vector has to be read before the number it comes with, because it is
++	 * the only thing that says which of the datagrams below that number
++	 * actually arrived.
++	 */
++	if ((flags & RDPUDP_FLAG_ACK) && !(flags & RDPUDP_FLAG_SYN))
++	{
++		if (pos + 2 > len)
++		{
++			WLog_WARN(TAG, "v1_data: packet too short for ACK_VECTOR_HEADER");
++			return;
++		}
++		/* uAckVectorSize (2 bytes, BE) = number of bytes in AckVector */
++		ack_vector_len = ((UINT16)data[pos] << 8) | data[pos + 1];
++		pos += 2;
++
++		if (pos + ack_vector_len > len)
++		{
++			WLog_WARN(TAG, "v1_data: ACK vector of %u bytes does not fit in a "
++			               "%zu-byte packet",
++			          ack_vector_len, len);
++			return;
++		}
++		ack_vector = &data[pos];
++		pos += ack_vector_len;
++
++		/* Pad to DWORD boundary: the ACK section (2 + ack_vector_len) must be DWORD-aligned */
++		pos += (4 - ((2 + (size_t)ack_vector_len) % 4)) % 4;
++
++		WLog_DBG(TAG, "v1_data: ACK_VECTOR size=%u, pos after ACK=%zu",
++		         ack_vector_len, pos);
++	}
++
++	/* Update flow control state from peer's ACK info */
++	if (snSourceAck != 0xFFFFFFFF)
++	{
++		/* Only advance (never go backwards) */
++		INT32 delta = (INT32)(snSourceAck - conn->v1_acked_sn);
++
++		/*
++		 * An acknowledgement for something that was never sent is not an
++		 * acknowledgement. The FEC header is plaintext and unauthenticated --
++		 * it is read long before TLS has anything to say about the packet -- so
++		 * this number is whatever the sender chose, and the loop below walks
++		 * every value between the old one and it. Two thousand million
++		 * iterations, from one datagram, on the thread serving the session.
++		 *
++		 * Nothing past what has actually been sent can be acknowledged.
++		 */
++		if (delta > 0 && (UINT32)delta > conn->v1_send_sn - conn->v1_acked_sn)
++		{
++			WLog_WARN(TAG, "v1_data: peer acknowledged sn=%u, beyond the %u we "
++			               "have sent; ignoring",
++			          snSourceAck, conn->v1_send_sn);
++			delta = 0;
++		}
++
++		if (delta > 0)
++		{
++			const UINT64 ack_now = rdpeudp_monotonic_ms();
++			const UINT32 old_acked = conn->v1_acked_sn;
++			RdpeudpSeqRange gaps[RDPEUDP_MAX_REPORTED_GAPS];
++			UINT32 n_gaps = 0;
++			UINT32 cumulative = snSourceAck;
++			BOOL holding = FALSE;
++			UINT32 missing = 0;
++			UINT32 cleared = 0;
++
++			/*
++			 * snSourceAck is the highest datagram the peer has seen, not the
++			 * highest it has seen without a gap. mstsc advances it straight past
++			 * datagrams it never received; the vector is where it says so, and
++			 * ignoring the vector meant retiring exactly those datagrams from the
++			 * retransmit buffer. What rides on this tunnel is a TLS stream, so a
++			 * hole in it is not a dropped frame -- the far end simply stops being
++			 * able to decode anything, in silence, and the graphics channel goes
++			 * quiet with nothing logged anywhere.
++			 */
++			if (ack_vector)
++				n_gaps = rdpeudp_ack_vector_gaps(ack_vector, ack_vector_len,
++				                                 snSourceAck, gaps);
++
++			/* Clear retransmit buffer entries for ACKed packets, taking a
++			 * round-trip sample from the newest one that was sent only once --
++			 * timing an ack for a retransmission cannot tell which copy it
++			 * answers, and guessing wrong poisons the estimate (Karn). */
++			for (UINT32 sn = conn->v1_acked_sn + 1;
++			     sn != snSourceAck + 1; sn++)
++			{
++				const UINT32 idx = sn % 2048;
++
++				if (n_gaps > 0 && rdpeudp_seq_in_ranges(gaps, n_gaps, sn))
++				{
++					/* Keep it, and keep the acknowledgement below it, so the
++					 * retransmit timer finds it and sends it again. */
++					if (!holding)
++					{
++						cumulative = sn - 1;
++						holding = TRUE;
++					}
++					missing++;
++					continue;
++				}
++
++				if (conn->retransmit_buf[idx].in_use)
++				{
++					if (!conn->retransmit_buf[idx].retransmitted)
++					{
++						const UINT64 sent = conn->retransmit_buf[idx].send_time_ms;
++
++						if (ack_now >= sent)
++							rdpeudp_conn_update_rtt(conn, (UINT32)(ack_now - sent));
++					}
++					/* Only the first ack for a datagram is news. While a hole is
++					 * held the scan starts from below it every time, so counting
++					 * every pass would open the window on one delivery. */
++					cleared++;
++					if (conn->unacked_count > 0)
++						conn->unacked_count--;
++				}
++				conn->retransmit_buf[idx].in_use = FALSE;
++				conn->retransmit_buf[idx].retransmitted = FALSE;
++			}
++
++			if (missing > 0)
++			{
++				/* The peer is describing loss. That is the congestion signal
++				 * this transport exists to act on, and it is rate-limited to
++				 * once a round trip inside. */
++				rdpeudp_conn_on_loss(conn, ack_now);
++
++				if (!conn->ack_gap_pending)
++				{
++					conn->ack_gap_pending = TRUE;
++					conn->ack_gap_started_ms = ack_now;
++					conn->ack_gap_slow_reported = FALSE;
++					conn->ack_gap_episodes++;
++					conn->ack_gap_datagrams += missing;
++
++					/*
++					 * Send them now, not when a timer says they might be lost.
++					 *
++					 * The peer has just stated that it does not have these. The
++					 * retransmit scan would still hold them for a full timeout
++					 * first -- at least RETRANSMIT_RTO_MIN_MS, and double that
++					 * again for every backoff -- which on a path measured at
++					 * 2 ms is between one and two hundred round trips of
++					 * waiting for news that has already arrived. Measured
++					 * against mstsc, holes took a median of 371 ms to close and
++					 * at the tail almost four seconds, and what the tunnel
++					 * carries is reassembled strictly in order, so for all of
++					 * that the client can deliver nothing behind the hole and
++					 * the picture stops.
++					 *
++					 * Clearing the timer makes them eligible on the spot, and
++					 * the scan at the end of this function sends them. Once per
++					 * episode: if the retransmission is itself lost, the
++					 * ordinary timeout takes over, which is where a backoff
++					 * belongs.
++					 */
++					for (UINT32 i = 0; i < n_gaps; i++)
++					{
++						for (UINT32 sn = gaps[i].lo; sn != gaps[i].hi + 1; sn++)
++						{
++							if (conn->retransmit_buf[sn % 2048].in_use)
++								conn->retransmit_buf[sn % 2048].send_time_ms = 0;
++						}
++					}
++					conn->fast_retransmit_pending = TRUE;
++
++					/*
++					 * A hole that gets repaired is the transport doing its job,
++					 * and on a link losing a few datagrams a second there is one
++					 * of these several times a second -- so say it once, plainly,
++					 * and then keep count. The periodic summary carries the rate,
++					 * and a hole that is not repaired promptly says so itself.
++					 */
++					if (conn->ack_gap_summary_due_ms == 0)
++					{
++						conn->ack_gap_summary_due_ms = ack_now + ACK_GAP_SUMMARY_INTERVAL_MS;
++						WLog_INFO(TAG, "the peer reports %u datagram(s) it never "
++						               "received, from sn=%u; holding the "
++						               "acknowledgement at %u and sending them "
++						               "again rather than retiring them",
++						          missing, cumulative + 1, cumulative);
++					}
++					else
++					{
++						WLog_DBG(TAG, "the peer reports %u datagram(s) it never "
++						              "received, from sn=%u; holding at %u",
++						         missing, cumulative + 1, cumulative);
++					}
++				}
++			}
++			else if (conn->ack_gap_pending)
++			{
++				const UINT64 took = ack_now - conn->ack_gap_started_ms;
++
++				conn->ack_gap_pending = FALSE;
++				if (took > conn->ack_gap_worst_ms)
++					conn->ack_gap_worst_ms = took;
++
++				if (conn->ack_gap_slow_reported)
++				{
++					WLog_INFO(TAG, "the peer has everything up to sn=%u after "
++					               "%" PRIu64 " ms; the gap is filled",
++					          snSourceAck, took);
++				}
++				else
++				{
++					WLog_DBG(TAG, "the peer has everything up to sn=%u after "
++					              "%" PRIu64 " ms; the gap is filled",
++					         snSourceAck, took);
++				}
++			}
++
++			WLog_DBG(TAG, "v1_data: peer ACKed up to sn=%u (cumulative %u, was %u, "
++			         "%u still missing, window=%u, cwnd=%u, srtt=%ums, rto=%ums)",
++			         snSourceAck, cumulative, old_acked, missing, recvWinSize,
++			         conn->cwnd, conn->srtt_ms, conn->rto_ms);
++
++			/*
++			 * Only real forward progress clears the give-up counter. Datagrams
++			 * acknowledged past a hole say the path works; they do not say the
++			 * hole can be repaired, and treating them as though they did would
++			 * leave a tunnel resending an unfillable gap for ever.
++			 */
++			if ((INT32)(cumulative - old_acked) > 0)
++			{
++				conn->v1_acked_sn = cumulative;
++				conn->rto_backoff = 0;
++				if (conn->retransmit_given_up)
++				{
++					conn->retransmit_given_up = FALSE;
++					WLog_INFO(TAG, "the peer is acknowledging again; using the "
++					               "tunnel once more");
++				}
++			}
++
++			rdpeudp_conn_on_ack(conn, cleared);
++		}
++	}
++	if (recvWinSize > 0)
++		conn->peer_recv_window = recvWinSize;
++
++	WLog_DBG(TAG, "v1_data: len=%zu, flags=0x%04X", len, flags);
++
++	/* The ACK vector was read above; pos is already past it. */
++
++	/* Skip ACK_OF_ACKVECTOR if flag 0x0100 set */
++	if (flags & RDPUDP_FLAG_ACKOFACKS)
++	{
++		pos += 4; /* snResetSeqNum (4 bytes) */
++		WLog_DBG(TAG, "v1_data: skipped ACK_OF_ACKS, pos=%zu", pos);
++	}
++
++	/* Parse SOURCE_PAYLOAD_HEADER if DATA flag set (and not FEC) */
++	if ((flags & RDPUDP_FLAG_DATA) && !(flags & RDPUDP_FLAG_FEC))
++	{
++		if (pos + 8 > len)
++		{
++			WLog_WARN(TAG, "v1_data: packet too short for SOURCE_PAYLOAD_HEADER (pos=%zu, len=%zu)", pos, len);
++			return;
++		}
++
++		/* snCoded (4 bytes, BE) */
++		UINT32 snCoded = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) |
++		                 ((UINT32)data[pos+2] << 8) | data[pos+3];
++		pos += 4;
++		/* snSourceStart (4 bytes, BE) */
++		UINT32 snSourceStart = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) |
++		                       ((UINT32)data[pos+2] << 8) | data[pos+3];
++		pos += 4;
++		/* Say, once, what the peer's two sequence numbers actually are. */
++		if (!conn->sn_fields_reported)
++		{
++			conn->sn_fields_reported = TRUE;
++			WLog_INFO(TAG, "peer sequence numbers: coded=%u source=%u (%s)",
++			          snCoded, snSourceStart,
++			          (snCoded == snSourceStart) ? "the same, as this server "
++			                                       "sends them"
++			                                     : "distinct, as the "
++			                                       "specification allows");
++		}
++
++		/*
++		 * A source sequence number at or below the highest already seen is the
++		 * peer resending data -- which is the case the receive path has to get
++		 * right, and the one no one here has ever observed.
++		 */
++		if (conn->source_sn_valid &&
++		    (INT32)(snSourceStart - conn->source_sn_highest) <= 0)
++		{
++			if (!conn->source_replay_reported)
++			{
++				conn->source_replay_reported = TRUE;
++				WLog_INFO(TAG, "peer resent source sn=%u (highest seen %u) with "
++				               "coded sn=%u: a retransmission %s the coded "
++				               "number",
++				          snSourceStart, conn->source_sn_highest, snCoded,
++				          (snCoded == snSourceStart) ? "reuses" : "advances");
++			}
++		}
++		else
++		{
++			conn->source_sn_highest = snSourceStart;
++			conn->source_sn_valid = TRUE;
++		}
++
++		/* The first data packet defines where the stream starts. */
++		if (!conn->v1_recv_sn_valid)
++		{
++			conn->v1_recv_next = snSourceStart;
++			conn->v1_recv_sn_highest = snCoded;
++			conn->v1_recv_sn_valid = TRUE;
++		}
++
++		RdpeudpRecvDisposition disposition;
++
++		/*
++		 * The stream is keyed on the source sequence number, not the coded one.
++		 *
++		 * MS-RDPEUDP counts transmissions with snCoded and names the data with
++		 * snSourceStart, and a retransmission is by definition the same data
++		 * sent again. Keying on snCoded is only right if the peer reuses it for
++		 * a retransmission -- which is what this server happens to do, and
++		 * which nothing here has ever checked the client against. Keyed on the
++		 * source number, the reassembly is right either way: a resent packet
++		 * lands on the position it belongs to whether or not its coded number
++		 * moved.
++		 */
++		{
++			const UINT32 slot = snSourceStart % RDPEUDP_REORDER_WINDOW;
++
++			disposition = rdpeudp_recv_classify(snSourceStart, conn->v1_recv_next,
++			                                    conn->reorder_buf[slot].in_use);
++
++			if (disposition == RDPEUDP_RECV_DUPLICATE)
++			{
++				WLog_DBG(TAG, "v1_data: already have source sn=%u (next=%u), "
++				              "sending ACK-only",
++				         snSourceStart, conn->v1_recv_next);
++				rdpeudp_conn_send_ack(conn);
++				return;
++			}
++
++			/*
++			 * A bound on how far ahead it may be. Without one, a single packet
++			 * naming a number half the sequence space away would push what the
++			 * stream is waiting for out of reach of everything genuine.
++			 */
++			if (disposition == RDPEUDP_RECV_TOO_FAR)
++			{
++				WLog_WARN(TAG, "v1_data: source sn=%u is %d past the one the "
++				               "stream is waiting for (%u); refusing to jump "
++				               "the sequence space",
++				          snSourceStart,
++				          (INT32)(snSourceStart - conn->v1_recv_next),
++				          conn->v1_recv_next);
++				rdpeudp_conn_send_ack(conn);
++				return;
++			}
++		}
++
++		/* Accepted: only now does it become what we acknowledge. Assigning
++		 * before the checks let a rejected packet still set what the server
++		 * told the real client it had received. */
++		if ((INT32)(snCoded - conn->v1_recv_sn_highest) > 0)
++		{
++			/* Everything skipped over is a gap until it arrives. */
++			UINT32 missing = conn->v1_recv_sn_highest + 1;
++
++			for (; missing != snCoded; missing++)
++				rdpeudp_recv_seen_clear(conn, missing);
++
++			conn->v1_recv_sn_highest = snCoded;
++		}
++		rdpeudp_recv_seen_set(conn, snCoded);
++		conn->v1_recv_sn = snCoded;
++
++		/* Remaining bytes = DTLS payload */
++		size_t payload_len = len - pos;
++		WLog_DBG(TAG, "v1_data: snCoded=%u, payload offset=%zu, payload_len=%zu",
++		          snCoded, pos, payload_len);
++
++		if (payload_len > 0 && payload_len < 65536)
++		{
++			/* Hex dump first 16 bytes of DTLS payload */
++			char hexbuf[16 * 3 + 1];
++			size_t dump_len = (payload_len < 16) ? payload_len : 16;
++			for (size_t i = 0; i < dump_len; i++)
++				snprintf(hexbuf + i * 3, 4, "%02X ", data[pos + i]);
++			hexbuf[dump_len * 3] = '\0';
++WLog_DBG(TAG, "v1_data: DTLS payload first %zu bytes: %s", dump_len, hexbuf);
++
++			if (!rdpeudp_conn_deliver_in_order(conn, snSourceStart, &data[pos],
++			                                   payload_len, disposition))
++			{
++				/* Held, not delivered: nothing new to read out of TLS yet. */
++				rdpeudp_conn_send_ack(conn);
++				return;
++			}
++
++			if (conn->state == RDPEUDP_STATE_DTLS_HANDSHAKE)
++			{
++				/*
++				 * Completing the handshake proves nothing -- the server asks the
++				 * peer for no certificate -- so the session is not told about
++				 * this connection here. It is told at the cookie match, which is
++				 * also where the connection stops being reapable.
++				 *
++				 * Those two have to be the same moment. Telling the session
++				 * first left it holding a pointer the reaper still considered
++				 * disposable: a peer that completed the handshake and then went
++				 * quiet had its connection retired out from under the session,
++				 * which went on reading it.
++				 */
++				rdpeudp_conn_drive_dtls(conn);
++			}
++			else if (conn->state == RDPEUDP_STATE_CONNECTED)
++			{
++				/* Read decrypted application data (RDPEMT PDUs).
++				 * Loop SSL_read because BIO may buffer multiple TLS records. */
++				BYTE appdata[16384];
++				int n;
++				while ((n = SSL_read(conn->dtls, appdata, sizeof(appdata))) > 0)
++				{
++					/* This record carried this session's keys, and it came
++					 * from somewhere; if that is the address that asked to be
++					 * believed, believe it. */
++					rdpeudp_conn_confirm_rebind(conn, from, from_len);
++
++					/* Client application data over UDP: the path carries
++					 * traffic in both directions, which is the thing the
++					 * graphics channel was waiting to be told. */
++					if (!conn->saw_client_data)
++					{
++						conn->saw_client_data = TRUE;
++						WLog_INFO(TAG, "UDP path confirmed by client data");
++					}
++
++					/* Parse RDPEMT PDUs in a loop (TLS stream may concatenate multiple) */
++					int pos = 0;
++					while (pos + 4 <= n)
++					{
++						UINT8 action = appdata[pos];
++						UINT16 pld_len = (UINT16)appdata[pos+1] | ((UINT16)appdata[pos+2] << 8);
++						UINT8 hdr_len = appdata[pos+3];
++						int pdu_total = hdr_len + pld_len;
++
++						/*
++						 * MS-RDPEMT 2.2.1.1: the tunnel header is Action,
++						 * PayloadLength and HeaderLength, so it is never
++						 * shorter than four bytes. A peer that says otherwise
++						 * makes no forward progress through this loop, and a
++						 * header of zero makes none at all -- four zero bytes
++						 * inside the TLS session used to spin here forever.
++						 * Anyone can open that session: the server asks the
++						 * client for no certificate.
++						 */
++						if (hdr_len < 4)
++						{
++							WLog_WARN(TAG, "v1_data: RDPEMT header claims %u bytes; "
++							               "dropping the rest of this record",
++							          hdr_len);
++							break;
++						}
++
++						if (pos + pdu_total > n)
++						{
++							WLog_WARN(TAG, "v1_data: truncated RDPEMT PDU at pos=%d, need %d, have %d",
++							          pos, pdu_total, n - pos);
++							break;
++						}
++
++						if (action == 0x00 && !conn->tunnel_created)
++						{
++							/* MS-RDPEMT Tunnel Create Request */
++							int cookie_offset = pos + hdr_len + 8;
++							if (cookie_offset + 16 <= n)
++							{
++								UINT32 req_id = (UINT32)appdata[pos+hdr_len] |
++								                ((UINT32)appdata[pos+hdr_len+1] << 8) |
++								                ((UINT32)appdata[pos+hdr_len+2] << 16) |
++								                ((UINT32)appdata[pos+hdr_len+3] << 24);
++
++								/*
++								 * The cookie is what lets a UDP tunnel join an
++								 * existing session, so it never goes to the log:
++								 * anyone who could read it there could present
++								 * it. Whether it matched is the part worth
++								 * knowing, and that is safe to say.
++								 */
++								const BYTE* cookie = &appdata[cookie_offset];
++								WLog_DBG(TAG, "RDPEMT CreateRequest: reqId=%u, payloadLen=%u, hdrLen=%u",
++								         req_id, pld_len, hdr_len);
++
++								/*
++								 * Against this connection's own registration,
++								 * and only if it has one.
++								 *
++								 * Matching any outstanding cookie meant a cookie
++								 * issued for one session satisfied a connection
++								 * wired to another. And a connection whose SYN
++								 * arrived with nothing registered keeps the
++								 * sixteen zero bytes calloc gave it -- so once
++								 * the registration aged out, a create request
++								 * carrying sixteen zeroes matched that, and the
++								 * flags it set made the connection permanent.
++								 */
++								BOOL matched =
++								    conn->has_expected_cookie &&
++								    CRYPTO_memcmp(cookie, conn->expected_cookie, 16) == 0;
++
++								if (matched)
++									WLog_DBG(TAG, "RDPEMT cookie matched; sending CreateResponse (S_OK)");
++
++								if (!matched)
++								{
++									WLog_WARN(TAG, "RDPEMT tunnel create refused: cookie matches none of "
++									               "the %d registered (session takeover attempt, or a "
++									               "stale client)", conn->server->n_pending);
++								}
++
++								if (matched)
++								{
++									BYTE resp[12];
++									resp[0] = 0x01; /* Action=CreateResponse */
++									resp[1] = 0x08; resp[2] = 0x00; /* PayloadLength=8 */
++									resp[3] = 0x04; /* HeaderLength=4 */
++									resp[4] = (BYTE)(req_id & 0xFF);
++									resp[5] = (BYTE)((req_id >> 8) & 0xFF);
++									resp[6] = (BYTE)((req_id >> 16) & 0xFF);
++									resp[7] = (BYTE)((req_id >> 24) & 0xFF);
++									resp[8] = 0x00; resp[9] = 0x00;
++									resp[10] = 0x00; resp[11] = 0x00;
++
++									SSL_write(conn->dtls, resp, 12);
++									rdpeudp_conn_flush_dtls_out(conn);
++
++									conn->tunnel_created = TRUE;
++									/*
++									 * Now it has proved it knows the cookie. Only
++									 * from here is it the session's connection,
++									 * exempt from reaping and from eviction --
++									 * setting this at handshake completion let
++									 * any stranger pin a slot for good.
++									 */
++									conn->handed_to_app = TRUE;
++
++									/* And only now is the session told, in the
++									 * same breath, so there is no window in
++									 * which it holds a reapable pointer. */
++									if (conn->connected_cb)
++										conn->connected_cb(conn, conn->userdata);
++
++									WLog_INFO(TAG, "RDPEMT tunnel created successfully!");
++								}
++							}
++						}
++						else if (action == 0x02 && conn->tunnel_created)
++						{
++							/* Tunnel Data PDU — enqueue payload as one discrete message */
++							if (pld_len > 0 && conn->recv_msg_count < 256)
++							{
++								UINT16 idx = conn->recv_msg_tail;
++								conn->recv_msgs[idx].data = malloc(pld_len);
++								if (conn->recv_msgs[idx].data)
++								{
++									memcpy(conn->recv_msgs[idx].data, &appdata[pos + hdr_len], pld_len);
++									conn->recv_msgs[idx].len = pld_len;
++									conn->recv_msg_tail = (idx + 1) % 256;
++									conn->recv_msg_count++;
++									SetEvent(conn->event);
++								}
++							}
++						}
++						else
++						{
++							WLog_DBG(TAG, "v1_data: RDPEMT action=0x%02X (tunnel=%d, pld=%u, hdr=%u)",
++							         action, conn->tunnel_created, pld_len, hdr_len);
++						}
++
++						pos += pdu_total;
++					}
++				}
++				rdpeudp_conn_flush_dtls_out(conn);
++			}
++		}
++
++		/* Always ACK the received source packet */
++		rdpeudp_conn_send_ack(conn);
++	}
++
++	/* After updating v1_acked_sn (from any packet's FEC header),
++	 * try to flush buffered TLS data that was blocked by send window.
++	 * Also drain any buffered SSL records even if this was an ACK-only packet. */
++	if (conn->state == RDPEUDP_STATE_CONNECTED)
++	{
++		/* Try to read any pending TLS records (may have been buffered from
++		 * earlier BIO_writes but not yet returned by SSL_read) */
++		if (conn->tunnel_created && conn->dtls)
++		{
++			BYTE appdata[16384];
++			int n;
++			while ((n = SSL_read(conn->dtls, appdata, sizeof(appdata))) > 0)
++			{
++				int rdp_pos = 0;
++				while (rdp_pos + 4 <= n)
++				{
++					UINT8 action = appdata[rdp_pos];
++					UINT16 pld_len = (UINT16)appdata[rdp_pos+1] | ((UINT16)appdata[rdp_pos+2] << 8);
++					UINT8 hdr_len = appdata[rdp_pos+3];
++					int pdu_total = hdr_len + pld_len;
++
++					/* As above: a header shorter than the header cannot
++					 * advance, and zero would not advance at all. */
++					if (hdr_len < 4)
++						break;
++
++					if (rdp_pos + pdu_total > n)
++						break;
++
++					if (action == 0x02 && pld_len > 0 && conn->recv_msg_count < 256)
++					{
++						UINT16 idx = conn->recv_msg_tail;
++						conn->recv_msgs[idx].data = malloc(pld_len);
++						if (conn->recv_msgs[idx].data)
++						{
++							memcpy(conn->recv_msgs[idx].data, &appdata[rdp_pos + hdr_len], pld_len);
++							conn->recv_msgs[idx].len = pld_len;
++							conn->recv_msg_tail = (idx + 1) % 256;
++							conn->recv_msg_count++;
++							SetEvent(conn->event);
++						}
++					}
++					rdp_pos += pdu_total;
++				}
++			}
++		}
++
++		rdpeudp_conn_flush_dtls_out(conn);
++		rdpeudp_conn_retransmit_check(conn);
++	}
++}
++
++/* ============================================================
++ * Server implementation
++ * ============================================================ */
++
++rdpRdpeudpServer* rdpeudp_server_new(int port)
++{
++	rdpRdpeudpServer* server = calloc(1, sizeof(rdpRdpeudpServer));
++	if (!server)
++		return NULL;
++
++	server->port = port;
++	server->sockfd = -1;
++	InitializeCriticalSection(&server->pending_lock);
++
++	/* Create UDP socket */
++	server->sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
++	if (server->sockfd < 0)
++	{
++		/* Fallback to IPv4 */
++		server->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
++		if (server->sockfd < 0)
++		{
++			WLog_ERR(TAG, "Failed to create UDP socket: %s", strerror(errno));
++			free(server);
++			return NULL;
++		}
++
++		struct sockaddr_in addr4 = { 0 };
++		addr4.sin_family = AF_INET;
++		addr4.sin_port = htons(port);
++		addr4.sin_addr.s_addr = INADDR_ANY;
++		if (bind(server->sockfd, (struct sockaddr*)&addr4, sizeof(addr4)) < 0)
++		{
++			WLog_ERR(TAG, "Failed to bind UDP socket to port %d: %s", port, strerror(errno));
++			close(server->sockfd);
++			free(server);
++			return NULL;
++		}
++	}
++	else
++	{
++		/* IPv6 dual-stack */
++		int off = 0;
++		setsockopt(server->sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
++
++		struct sockaddr_in6 addr6 = { 0 };
++		addr6.sin6_family = AF_INET6;
++		addr6.sin6_port = htons(port);
++		addr6.sin6_addr = in6addr_any;
++		if (bind(server->sockfd, (struct sockaddr*)&addr6, sizeof(addr6)) < 0)
++		{
++			WLog_ERR(TAG, "Failed to bind UDP6 socket to port %d: %s", port, strerror(errno));
++			close(server->sockfd);
++			free(server);
++			return NULL;
++		}
++	}
++
++	/* Set non-blocking */
++	int flags = fcntl(server->sockfd, F_GETFL, 0);
++	fcntl(server->sockfd, F_SETFL, flags | O_NONBLOCK);
++
++	/* Increase receive buffer */
++	int rcvbuf = 1048576;
++	setsockopt(server->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
++
++	/* And the send buffer, which had been left at the system default while the
++	 * receive side was raised to a megabyte. The congestion window is what
++	 * really keeps the buffer from filling; this only widens the margin. */
++	int sndbuf = 1048576;
++	setsockopt(server->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
++
++	/* Create shared TLS context (for reliable channel) */
++	server->dtls_ctx = rdpeudp_create_dtls_ctx();
++	if (!server->dtls_ctx)
++	{
++		WLog_ERR(TAG, "Failed to create TLS context for RDPEUDP");
++		close(server->sockfd);
++		free(server);
++		return NULL;
++	}
++
++	WLog_INFO(TAG, "RDPEUDP server listening on UDP port %d (fd=%d)", port, server->sockfd);
++	return server;
++}
++
++void rdpeudp_server_free(rdpRdpeudpServer* server)
++{
++	if (!server)
++		return;
++
++	/* Freeing a connection removes it from this array and shrinks the count,
++	 * so walking the array forwards skipped every other one and leaked it --
++	 * a couple of megabytes each, once per session. Always take the last. */
++	while (server->n_connections > 0)
++		rdpeudp_conn_free(server->connections[server->n_connections - 1]);
++
++	if (server->dtls_ctx)
++		SSL_CTX_free(server->dtls_ctx);
++
++	if (server->sockfd >= 0)
++		close(server->sockfd);
++
++	DeleteCriticalSection(&server->pending_lock);
++	free(server);
++}
++
++BOOL rdpeudp_server_set_tls_credentials(rdpRdpeudpServer* server,
++                                         const char* cert_pem,
++                                         const char* key_pem)
++{
++	if (!server || !cert_pem || !key_pem)
++		return FALSE;
++
++	/*
++	 * Only before any connection exists. Replacing the context frees one that
++	 * live SSL objects still reference, so calling this once the listener has
++	 * accepted anything is an immediate use-after-free across every connection.
++	 * It is called once, from connection setup; refuse rather than trust that.
++	 */
++	if (server->n_connections > 0)
++	{
++		WLog_ERR(TAG, "Refusing to replace the TLS context with %d connections "
++		              "already established",
++		         server->n_connections);
++		return FALSE;
++	}
++
++	/*
++	 * Build and validate the replacement before letting go of what works.
++	 *
++	 * Freeing the live context first meant any parse failure after that point
++	 * left dtls_ctx NULL for the life of the process -- the tunnel then never
++	 * worked, silently, and the caller was told nothing because it ignores the
++	 * return value.
++	 */
++	const SSL_METHOD* method = TLS_server_method();
++	if (!method)
++	{
++		WLog_ERR(TAG, "TLS_server_method() failed");
++		return FALSE;
++	}
++
++	SSL_CTX* ctx = SSL_CTX_new(method);
++	if (!ctx)
++	{
++		WLog_ERR(TAG, "SSL_CTX_new() failed");
++		return FALSE;
++	}
++
++	/* Load cert from PEM string */
++	BIO* bio_cert = BIO_new_mem_buf(cert_pem, -1);
++	X509* cert = PEM_read_bio_X509(bio_cert, NULL, NULL, NULL);
++	BIO_free(bio_cert);
++	if (!cert)
++	{
++		WLog_ERR(TAG, "Failed to parse certificate PEM for RDPEUDP TLS");
++		SSL_CTX_free(ctx);
++		return FALSE;
++	}
++
++	/* Load key from PEM string */
++	BIO* bio_key = BIO_new_mem_buf(key_pem, -1);
++	EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio_key, NULL, NULL, NULL);
++	BIO_free(bio_key);
++	if (!pkey)
++	{
++		WLog_ERR(TAG, "Failed to parse private key PEM for RDPEUDP TLS");
++		X509_free(cert);
++		SSL_CTX_free(ctx);
++		return FALSE;
++	}
++
++	if (SSL_CTX_use_certificate(ctx, cert) != 1 ||
++	    SSL_CTX_use_PrivateKey(ctx, pkey) != 1 ||
++	    SSL_CTX_check_private_key(ctx) != 1)
++	{
++		WLog_ERR(TAG, "The certificate and key for the tunnel do not load as a "
++		              "usable pair; keeping the existing context");
++		X509_free(cert);
++		EVP_PKEY_free(pkey);
++		SSL_CTX_free(ctx);
++		return FALSE;
++	}
++
++	X509_free(cert);
++	EVP_PKEY_free(pkey);
++
++	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
++	/*
++	 * 1.2, not 1.0.
++	 *
++	 * The main connection is pinned at 1.2 by FreeRDP's own defaults, and this
++	 * tunnel is meant to be the same server. Asking for a 1.0 floor here was
++	 * saved only by OpenSSL's compiled-in security level refusing SHA1
++	 * signatures -- an unstated property of this build, not a decision.
++	 */
++	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
++	SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
++
++	/* Only now, with a validated replacement in hand. */
++	if (server->dtls_ctx)
++		SSL_CTX_free(server->dtls_ctx);
++	server->dtls_ctx = ctx;
++
++	WLog_DBG(TAG, "RDPEUDP TLS credentials updated from TCP certificate");
++	return TRUE;
++}
++
++int rdpeudp_server_get_fd(rdpRdpeudpServer* server)
++{
++	WINPR_ASSERT(server);
++	return server->sockfd;
++}
++
++/* Find an active connection by peer address.
++ * First tries exact match (IP + port), then falls back to IP-only match
++ * with snSourceAck validation for NAT rebinding tolerance.
++ * When NAT rebinding is detected, updates the stored peer address. */
++static rdpRdpeudpConn* rdpeudp_server_find_conn_ex(rdpRdpeudpServer* server,
++                                                     const struct sockaddr_storage* addr,
++                                                     socklen_t addrlen,
++                                                     const BYTE* data, size_t len)
++{
++	/* Exact match first */
++	for (int i = 0; i < server->n_connections; i++)
++	{
++		if (rdpeudp_addr_equal(&server->connections[i]->peer_addr,
++		                       server->connections[i]->peer_addr_len,
++		                       addr, addrlen))
++			return server->connections[i];
++	}
++
++	/* NAT rebinding fallback: match by IP + validate snSourceAck.
++	 * RDPEUDP v1 FEC_HEADER:
++	 *   [0..3] = snSourceAck (32-bit BE) — SN the client is ACK-ing from us
++	 *   [4..5] = uReceiveWindowSize (16-bit BE)
++	 *   [6..7] = uFlags (16-bit BE)
++	 * We verify snSourceAck is in our valid sent SN range. */
++	if (len >= 8)
++	{
++		UINT32 snSourceAck = ((UINT32)data[0] << 24) | ((UINT32)data[1] << 16) |
++		                     ((UINT32)data[2] << 8) | data[3];
++
++		for (int i = 0; i < server->n_connections; i++)
++		{
++			rdpRdpeudpConn* conn = server->connections[i];
++			if (!rdpeudp_addr_ip_equal(&conn->peer_addr, conn->peer_addr_len,
++			                           addr, addrlen))
++				continue;
++
++			/*
++			 * Only a session that is up can be moved, and only an
++			 * acknowledgement of something actually outstanding is worth
++			 * considering. That is a window of a few hundred rather than the
++			 * million this used to accept -- but it is still only a guess about
++			 * a plaintext field, so it proposes the address and does not adopt
++			 * it. The TLS session decides.
++			 */
++			/* v1_send_sn and v1_acked_sn are written by the thread that sends,
++			 * so take the connection's lock and read them once -- loading
++			 * v1_send_sn twice let the two expressions be computed from
++			 * different values, which widens the very window this check is
++			 * here to narrow. */
++			BOOL claim_plausible;
++
++			EnterCriticalSection(&conn->lock);
++			if (conn->state != RDPEUDP_STATE_CONNECTED)
++			{
++				LeaveCriticalSection(&conn->lock);
++				continue;
++			}
++			{
++				const UINT32 send_sn = conn->v1_send_sn;
++				const UINT32 outstanding = send_sn - conn->v1_acked_sn;
++				const UINT32 behind = send_sn - snSourceAck;
++
++				claim_plausible = behind <= outstanding;
++				if (claim_plausible)
++				{
++					memcpy(&conn->rebind_addr, addr, addrlen);
++					conn->rebind_addr_len = addrlen;
++					conn->rebind_pending = TRUE;
++				}
++			}
++			LeaveCriticalSection(&conn->lock);
++
++			if (!claim_plausible)
++				continue;
++
++			WLog_DBG(TAG, "conn %d: a datagram from a new address claims it "
++			              "(snSourceAck=%u); holding it until a record from "
++			              "there decrypts", i, snSourceAck);
++			return conn;
++		}
++	}
++
++	return NULL;
++}
++
++
++
++rdpRdpeudpConn* rdpeudp_server_register_cookie(rdpRdpeudpServer* server,
++                                                 const BYTE cookie[16],
++                                                 RdpeudpConnectedCb callback,
++                                                 void* userdata)
++{
++	WINPR_ASSERT(server);
++	WINPR_ASSERT(cookie);
++
++	EnterCriticalSection(&server->pending_lock);
++
++	if (server->n_pending >= 32)
++	{
++		WLog_WARN(TAG, "Too many pending cookies, dropping oldest");
++		memmove(&server->pending[0], &server->pending[1],
++		        sizeof(RdpeudpPendingCookie) * 31);
++		server->n_pending = 31;
++	}
++
++	RdpeudpPendingCookie* pc = &server->pending[server->n_pending++];
++	memcpy(pc->cookie, cookie, 16);
++	pc->callback = callback;
++	pc->userdata = userdata;
++	pc->conn = NULL;
++	pc->registered_at = rdpeudp_monotonic_ms();
++
++	WLog_DBG(TAG, "Registered pending cookie (now %d pending)", server->n_pending);
++	LeaveCriticalSection(&server->pending_lock);
++	return NULL; /* connection created when SYN arrives */
++}
++
++/* Handle a SYN packet from a new client */
++static void rdpeudp_server_handle_syn(rdpRdpeudpServer* server,
++                                       const BYTE* data, size_t len,
++                                       const struct sockaddr_storage* addr,
++                                       socklen_t addrlen)
++{
++	UINT32 initial_sn = 0;
++	UINT16 up_mtu = 0, down_mtu = 0, version = 0, flags = 0;
++	BYTE correlationid[16] = { 0 };
++
++	if (!rdpeudp_parse_syn(data, len, &initial_sn, &up_mtu, &down_mtu,
++	                        correlationid, &version, &flags))
++	{
++		WLog_WARN(TAG, "Failed to parse SYN packet (len=%zu)", len);
++		return;
++	}
++
++	WLog_DBG(TAG, "Received RDPEUDP SYN: sn=%u mtu_up=%u mtu_down=%u version=0x%04X flags=0x%04X",
++	         initial_sn, up_mtu, down_mtu, version, flags);
++
++	/* Use the first pending cookie entry (cookie will be verified later via MS-RDPEMT).
++	 * The SYN correlationId is NOT the same as the TCP securityCookie, and like
++	 * the cookie it is an identifier a listener would have to produce, so it
++	 * stays out of the log. */
++	/* Copy what is needed rather than keeping a pointer into an array another
++	 * thread appends to and this file's own timer compacts. */
++	BYTE expected_cookie[16] = { 0 };
++	RdpeudpConnectedCb pending_cb = NULL;
++	void* pending_userdata = NULL;
++	BOOL have_pending = FALSE;
++
++	EnterCriticalSection(&server->pending_lock);
++	if (server->n_pending > 0)
++	{
++		memcpy(expected_cookie, server->pending[0].cookie, 16);
++		pending_cb = server->pending[0].callback;
++		pending_userdata = server->pending[0].userdata;
++		have_pending = TRUE;
++		WLog_DBG(TAG, "Associating SYN with pending cookie entry (n_pending=%d)",
++		         server->n_pending);
++	}
++	else
++	{
++		WLog_WARN(TAG, "SYN received but no pending cookie entries — accepting anyway");
++	}
++	LeaveCriticalSection(&server->pending_lock);
++
++	/* Create connection */
++	rdpRdpeudpConn* conn = calloc(1, sizeof(rdpRdpeudpConn));
++	if (!conn)
++		return;
++
++	InitializeCriticalSection(&conn->lock);
++	conn->server = server;
++	rdpeudp_conn_init_congestion(conn);
++	conn->state = RDPEUDP_STATE_SYN_RECEIVED;
++	memcpy(&conn->peer_addr, addr, addrlen);
++	conn->peer_addr_len = addrlen;
++	conn->sn_initial_recv = initial_sn;
++	/* Generate our initial sequence number */
++	winpr_RAND((BYTE*)&conn->sn_initial_send, sizeof(conn->sn_initial_send));
++	/*
++	 * Clamp what the SYN asked for. This is an unauthenticated field, and it
++	 * does not stay in this file: the channel layer sizes a heap buffer from
++	 * rdpeudp_conn_get_max_pdu(), which is this value minus the header
++	 * overhead. A SYN naming eighty-three bytes made that buffer one byte long
++	 * and the dynamic-channel header did not fit in it.
++	 */
++	conn->upstream_mtu = rdpeudp_clamp_mtu(up_mtu);
++	conn->downstream_mtu = rdpeudp_clamp_mtu(down_mtu);
++	conn->negotiated_version = (version >= RDPUDP_VERSION_3) ? RDPUDP_VERSION_3
++	                           : (version >= RDPUDP_VERSION_2) ? RDPUDP_VERSION_2
++	                                                          : RDPUDP_VERSION_1;
++	conn->send_seq = 0;
++	conn->recv_seq = 0;
++	conn->v1_send_sn = conn->sn_initial_send + 1; /* First DATA SN after SYN-ACK */
++	conn->v1_recv_sn = conn->sn_initial_recv;       /* Updated as we receive v1 DATA */
++	conn->v1_acked_sn = conn->sn_initial_send;      /* Nothing acknowledged yet */
++	conn->peer_recv_window = 64;                     /* Default, updated from incoming ACKs */
++	conn->tunnel_created = FALSE;
++	conn->created_at_ms = rdpeudp_monotonic_ms();
++	if (have_pending)
++	{
++		memcpy(conn->expected_cookie, expected_cookie, 16);
++		conn->has_expected_cookie = TRUE;
++	}
++	conn->connected_cb = pending_cb;
++	conn->userdata = pending_userdata;
++	conn->event = CreateEvent(NULL, TRUE, FALSE, NULL);
++
++	/*
++	 * Build and send the SYN-ACK, never larger than the SYN that asked for it.
++	 *
++	 * The reply is padded to the MTU the sender asked for, and the sender is
++	 * unverified: nothing has proved it is at the address it claims. A sixteen
++	 * byte SYN naming a two kilobyte downstream MTU therefore bought a two
++	 * kilobyte datagram sent to whatever address was in the packet -- a
++	 * hundred and twenty eight fold amplifier, on a port the whole internet
++	 * scans.
++	 *
++	 * Real clients pad the SYN itself to the MTU they are proposing (mstsc
++	 * sends 1232 bytes for 1232), so answering within the size of the SYN
++	 * costs them nothing and leaves nothing to amplify.
++	 */
++	BYTE synack[2048];
++	size_t synack_budget = (len < sizeof(synack)) ? len : sizeof(synack);
++	int synack_len;
++
++	if (synack_budget < RDPEUDP_SYNACK_MIN_SIZE)
++	{
++		WLog_WARN(TAG, "Refusing a %zu-byte SYN: too short to answer without "
++		               "amplifying", len);
++		rdpeudp_conn_free (conn);
++		return;
++	}
++
++	synack_len = rdpeudp_build_synack(conn, synack, synack_budget);
++	if (synack_len > 0)
++	{
++		ssize_t sent = sendto(server->sockfd, synack, synack_len, 0,
++		                      (const struct sockaddr*)addr, addrlen);
++		if (sent < 0)
++			WLog_ERR(TAG, "Failed to send SYN-ACK: %s", strerror(errno));
++		else
++			WLog_DBG(TAG, "Sent RDPEUDP SYN-ACK (%d bytes, our_sn=%u, version=0x%04X)",
++			          synack_len, conn->sn_initial_send, conn->negotiated_version);
++	}
++
++	/* Register connection */
++	if (server->n_connections < RDPEUDP_MAX_CONNECTIONS)
++	{
++		server->connections[server->n_connections++] = conn;
++	}
++	else
++	{
++		/*
++		 * A SYN from anyone allocates one of these, and each carries a
++		 * megabytes-wide retransmit buffer. Sixty-four datagrams from
++		 * sixty-four source ports used to fill the table permanently and lock
++		 * the real client out of the tunnel for the life of the session.
++		 *
++		 * So a connection that never got a tunnel gives up its place -- the
++		 * NEWEST such one, not the oldest. Taking the oldest is exactly
++		 * backwards against an attacker, who can always make newer entries:
++		 * sixty-four SYNs after the real client's would evict the real
++		 * client's, every time it retried. A connection that did get a tunnel
++		 * has proved it knows the cookie and is never evicted for a stranger.
++		 */
++		int victim = -1;
++		UINT64 newest = 0;
++
++		for (int i = 0; i < server->n_connections; i++)
++		{
++			rdpRdpeudpConn* c = server->connections[i];
++
++			if (c->tunnel_created || c->handed_to_app)
++				continue;
++			if (victim < 0 || c->created_at_ms >= newest)
++			{
++				victim = i;
++				newest = c->created_at_ms;
++			}
++		}
++
++		if (victim < 0)
++		{
++			WLog_WARN(TAG, "Refusing a SYN: every connection has an "
++			               "established tunnel");
++			rdpeudp_conn_free(conn);
++			return;
++		}
++
++		WLog_WARN(TAG, "Connection table full; dropping the newest connection "
++		               "that never opened a tunnel to make room");
++		rdpeudp_conn_free(server->connections[victim]);
++		server->connections[server->n_connections++] = conn;
++	}
++}
++
++/* Handle ACK packet (completes 3-way handshake) */
++static void rdpeudp_conn_handle_ack(rdpRdpeudpConn* conn,
++                                     const BYTE* data, size_t len)
++{
++	if (len < 8)
++	{
++		WLog_WARN(TAG, "handle_ack: packet too short (%zu)", len);
++		return;
++	}
++
++	/* Parse FEC header (big-endian) */
++	UINT32 snSourceAck = ((UINT32)data[0] << 24) | ((UINT32)data[1] << 16) |
++	                     ((UINT32)data[2] << 8) | data[3];
++	UINT16 recvWinSize = ((UINT16)data[4] << 8) | data[5];
++	UINT16 flags = ((UINT16)data[6] << 8) | data[7];
++
++	WLog_DBG(TAG, "handle_ack: flags=0x%04X, need ACK=0x%04X", flags, RDPUDP_FLAG_ACK);
++	if (!(flags & RDPUDP_FLAG_ACK))
++	{
++		WLog_WARN(TAG, "handle_ack: no ACK flag set, ignoring");
++		return;
++	}
++
++	/* Update flow control state. As in the data path, an acknowledgement past
++	 * what was sent is refused: letting it through would put v1_acked_sn ahead
++	 * of v1_send_sn, and the unsigned difference the retransmit scan uses for
++	 * the in-flight count would become four thousand million.
++	 *
++	 * After the flag check, not before it: a datagram that is not an
++	 * acknowledgement was moving the flow-control state anyway. */
++	if (snSourceAck != 0xFFFFFFFF)
++	{
++		INT32 delta = (INT32)(snSourceAck - conn->v1_acked_sn);
++		if (delta > 0 && (UINT32)delta <= conn->v1_send_sn - conn->v1_acked_sn)
++			conn->v1_acked_sn = snSourceAck;
++	}
++	if (recvWinSize > 0)
++		conn->peer_recv_window = recvWinSize;
++
++	if (conn->state == RDPEUDP_STATE_SYN_RECEIVED)
++	{
++		/*
++		 * The acknowledgement has to name the sequence number we chose at
++		 * random in the SYN-ACK. Without that check the handshake completed
++		 * blind -- eight fixed bytes finished it -- so a forged source address
++		 * could stand up a connection it would never receive a reply for, and
++		 * everything that costs the server from there was free.
++		 */
++		if (snSourceAck != conn->sn_initial_send)
++		{
++			WLog_WARN(TAG, "Ignoring a handshake ACK for sn=%u; ours was %u",
++			          snSourceAck, conn->sn_initial_send);
++			return;
++		}
++
++		WLog_INFO(TAG, "RDPEUDP 3-way handshake complete (version 0x%04X), starting TLS",
++		          conn->negotiated_version);
++		conn->state = RDPEUDP_STATE_ESTABLISHED;
++
++		/*
++		 * Every version secures the reliable tunnel the same way: TLS carried
++		 * inside the reliable channel (MS-RDPEMT 1.3). This used to be done
++		 * only for the version that carries the RDPEUDP2 packet format, so a
++		 * client that negotiated anything else completed the handshake and then
++		 * heard nothing.
++		 */
++		if (!rdpeudp_conn_init_dtls(conn))
++		{
++			WLog_ERR(TAG, "Failed to start TLS over the reliable channel");
++			conn->state = RDPEUDP_STATE_CLOSED;
++		}
++	}
++}
++
++/*
++ * There is no RDPEUDP2 handler here.
++ *
++ * One existed, was never dispatched to, and enqueued decrypted bytes onto the
++ * receive queue with no tunnel-created check and no RDPEMT parsing -- so if the
++ * v2 framing were ever wired up it would have handed channel data straight past
++ * the cookie. Unreachable code that bypasses the only credential is worse than
++ * no code; write it against the spec when the framing is actually needed.
++ */
++
++/* Process a single UDP datagram */
++static void rdpeudp_server_process_dgram(rdpRdpeudpServer* server,
++                                          const BYTE* data, size_t len,
++                                          const struct sockaddr_storage* addr,
++                                          socklen_t addrlen)
++{
++	/* Check if we have an existing connection for this address (with NAT rebinding) */
++	rdpRdpeudpConn* conn = rdpeudp_server_find_conn_ex(server, addr, addrlen, data, len);
++
++	if (!conn)
++	{
++		/* Hex dump first 128 bytes for diagnostic.
++		 *
++		 * Inside the level check: this ran for every datagram from an unknown
++		 * peer whatever the log level, so a flood of unmatched packets bought
++		 * a hex dump each, on the thread that serves the session. */
++		if (WLog_IsLevelActive(WLog_Get(TAG), WLOG_DEBUG))
++		{
++			char hexbuf[128*3+1];
++			size_t dump_len = (len < 128) ? len : 128;
++			for (size_t i = 0; i < dump_len; i++)
++				snprintf(hexbuf + i*3, 4, "%02X ", data[i]);
++			hexbuf[dump_len*3] = '\0';
++
++			/* Log source address */
++			char addrstr[64] = "?";
++			if (addr->ss_family == AF_INET)
++			{
++				struct sockaddr_in *a4 = (struct sockaddr_in*)addr;
++				inet_ntop(AF_INET, &a4->sin_addr, addrstr, sizeof(addrstr));
++				char tmp[80];
++				snprintf(tmp, sizeof(tmp), "%s:%d", addrstr, ntohs(a4->sin_port));
++				strcpy(addrstr, tmp);
++			}
++			else if (addr->ss_family == AF_INET6)
++			{
++				struct sockaddr_in6 *a6 = (struct sockaddr_in6*)addr;
++				inet_ntop(AF_INET6, &a6->sin6_addr, addrstr, sizeof(addrstr));
++				char tmp[80];
++				snprintf(tmp, sizeof(tmp), "[%s]:%d", addrstr, ntohs(a6->sin6_port));
++				strcpy(addrstr, tmp);
++			}
++
++			WLog_DBG(TAG, "No conn for %zu-byte dgram from %s, first %zu bytes:\n%s",
++			          len, addrstr, dump_len, hexbuf);
++		}
++
++		/* New address — could be a SYN */
++		if (len >= 16)
++		{
++			UINT16 flags = ((UINT16)data[6] << 8) | data[7];  /* big-endian */
++			WLog_DBG(TAG, "Checking SYN: flags at [6..7] = 0x%04X (need 0x%04X)",
++			          flags, RDPUDP_FLAG_SYN);
++			if (flags & RDPUDP_FLAG_SYN)
++			{
++				rdpeudp_server_handle_syn(server, data, len, addr, addrlen);
++				return;
++			}
++		}
++		WLog_DBG(TAG, "Received %zu bytes from unknown peer, ignoring", len);
++		return;
++	}
++
++	/* Existing connection.
++	 *
++	 * Everything from here drives TLS and the sequence-number state, which the
++	 * peer thread is also writing through. */
++	EnterCriticalSection(&conn->lock);
++
++	WLog_DBG(TAG, "Existing conn state=%d, received %zu bytes, flags=0x%04X",
++	          conn->state, len,
++	          (len >= 8) ? (UINT16)((data[6] << 8) | data[7]) : 0);
++	switch (conn->state)
++	{
++	case RDPEUDP_STATE_SYN_RECEIVED:
++		/* Expecting ACK to complete handshake */
++		rdpeudp_conn_handle_ack(conn, data, len);
++		/* After state transition, process v1 DATA in the SAME packet */
++		if (conn->state == RDPEUDP_STATE_DTLS_HANDSHAKE ||
++		    conn->state == RDPEUDP_STATE_ESTABLISHED)
++		{
++			UINT16 pkt_flags = ((UINT16)data[6] << 8) | data[7];
++			if (pkt_flags & RDPUDP_FLAG_DATA)
++			{
++				WLog_DBG(TAG, "Processing v1 DATA from ACK+DATA packet");
++				rdpeudp_conn_handle_v1_data(conn, data, len, addr, addrlen);
++			}
++		}
++		break;
++
++	case RDPEUDP_STATE_ESTABLISHED:
++	case RDPEUDP_STATE_DTLS_HANDSHAKE:
++	case RDPEUDP_STATE_CONNECTED:
++		/* Use v1 DATA framing during DTLS handshake */
++		rdpeudp_conn_handle_v1_data(conn, data, len, addr, addrlen);
++		break;
++
++	default:
++		break;
++	}
++
++	LeaveCriticalSection(&conn->lock);
++}
++
++int rdpeudp_server_check_fds(rdpRdpeudpServer* server)
++{
++	WINPR_ASSERT(server);
++
++	int processed = 0;
++
++	/* Read all pending datagrams */
++	for (;;)
++	{
++		struct sockaddr_storage addr = { 0 };
++		socklen_t addrlen = sizeof(addr);
++
++		ssize_t n = recvfrom(server->sockfd, server->dgram_buf, sizeof(server->dgram_buf),
++		                     0, (struct sockaddr*)&addr, &addrlen);
++		if (n <= 0)
++		{
++			if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
++				WLog_ERR(TAG, "recvfrom() failed: %s", strerror(errno));
++			break;
++		}
++
++		rdpeudp_server_process_dgram(server, server->dgram_buf, (size_t)n, &addr, addrlen);
++		processed++;
++	}
++
++	/* TLS over reliable RDPEUDP doesn't need DTLS timeout handling.
++	 * The RDPEUDP v1 layer handles retransmissions.
++	 */
++
++	/* Expire old pending cookies (30 second timeout) */
++	UINT64 now = rdpeudp_monotonic_ms();
++	EnterCriticalSection(&server->pending_lock);
++	for (int i = server->n_pending - 1; i >= 0; i--)
++	{
++		if (now - server->pending[i].registered_at > 30000)
++		{
++			WLog_DBG(TAG, "Expiring pending cookie (age=%llu ms)",
++			          (unsigned long long)(now - server->pending[i].registered_at));
++			memmove(&server->pending[i], &server->pending[i+1],
++			        sizeof(RdpeudpPendingCookie) * (server->n_pending - i - 1));
++			server->n_pending--;
++		}
++	}
++	LeaveCriticalSection(&server->pending_lock);
++
++	/*
++	 * Retire connections that went nowhere.
++	 *
++	 * A SYN from any source creates one, and a closed one used to stay in the
++	 * table for the life of the session holding its retransmit buffer. Neither
++	 * a closed connection nor one that has sat unestablished for half a minute
++	 * is going to become useful.
++	 */
++	for (int i = server->n_connections - 1; i >= 0; i--)
++	{
++		rdpRdpeudpConn* conn = server->connections[i];
++		BOOL established = conn->state == RDPEUDP_STATE_CONNECTED;
++
++		/* Never the one the session is holding: freeing that would leave the
++		 * session reading freed memory, which is a worse outcome than the
++		 * exhaustion this loop exists to prevent. */
++		if (conn->handed_to_app)
++			continue;
++
++		if (conn->state != RDPEUDP_STATE_CLOSED &&
++		    (established ||
++		     now - conn->created_at_ms < RDPEUDP_UNESTABLISHED_TIMEOUT_MS))
++			continue;
++
++		WLog_DBG(TAG, "Retiring RDPEUDP connection in state %d after %llu ms",
++		         conn->state, (unsigned long long)(now - conn->created_at_ms));
++		rdpeudp_conn_free(conn);
++	}
++
++	/* Server-side keepalive: send ACK every 5 seconds to keep NAT mapping alive */
++	for (int i = 0; i < server->n_connections; i++)
++	{
++		rdpRdpeudpConn* conn = server->connections[i];
++
++		EnterCriticalSection(&conn->lock);
++
++		if (conn->state >= RDPEUDP_STATE_ESTABLISHED &&
++		    now - conn->last_keepalive_sent >= 5000)
++		{
++			rdpeudp_conn_send_ack(conn);
++			conn->last_keepalive_sent = now;
++		}
++
++		/* Periodic retransmission check */
++		if (conn->state == RDPEUDP_STATE_CONNECTED)
++			rdpeudp_conn_retransmit_check(conn);
++
++		LeaveCriticalSection(&conn->lock);
++	}
++
++	return processed;
++}
++
++/* ============================================================
++ * Connection API
++ * ============================================================ */
++
++void freerdp_peer_set_udp_connection(freerdp_peer* peer, rdpRdpeudpConn* conn)
++{
++	if (!peer || !peer->context || !peer->context->rdp)
++		return;
++
++	peer->context->rdp->udpConn = conn;
++}
++
++BOOL rdpeudp_conn_path_confirmed(rdpRdpeudpConn* conn)
++{
++	if (!conn)
++		return FALSE;
++
++	/*
++	 * The tunnel is usable once TLS is up over it and the client has answered
++	 * the Soft-Sync Request, which the caller checks separately. That is what
++	 * the protocol says, and waiting for more is what kept it idle: this used
++	 * to require having received application data from the client first, and
++	 * the client was waiting to be sent some. Both ends waited, the tunnel
++	 * carried the handshake and then nothing, and every channel stayed on TCP.
++	 *
++	 * saw_client_data is still tracked, because it is worth logging the first
++	 * time traffic comes back the other way, but it is not a precondition.
++	 */
++	/*
++	 * And not while nothing sent over it is being acknowledged: what goes into
++	 * a tunnel the peer has stopped answering is not delivered, it is queued
++	 * behind a window that never opens. TCP is still there and still works.
++	 */
++	return conn->state == RDPEUDP_STATE_CONNECTED && !conn->retransmit_given_up;
++}
++
++RdpeudpState rdpeudp_conn_get_state(rdpRdpeudpConn* conn)
++{
++	WINPR_ASSERT(conn);
++	return conn->state;
++}
++
++HANDLE rdpeudp_conn_get_event(rdpRdpeudpConn* conn)
++{
++	WINPR_ASSERT(conn);
++	return conn->event;
++}
++
++size_t rdpeudp_conn_get_max_pdu(rdpRdpeudpConn* conn)
++{
++	WINPR_ASSERT(conn);
++	/* Max RDPEMT payload (plaintext) that fits in a single v1 packet within MTU.
++	 * v1 header = 20 bytes (FEC 8 + ACK 4 + SOURCE 8)
++	 * TLS 1.2 overhead (empirically ~58 bytes for AES-256-GCM-SHA384 with OpenSSL 3.x)
++	 * RDPEMT header = 4 bytes (Action + PayloadLength + HeaderLength)
++	 * So max DVC PDU = MTU - 20 - 58 - 4 */
++	int overhead = 20 + 58 + 4;
++	int max_pdu;
++
++	EnterCriticalSection(&conn->lock);
++	max_pdu = (int)conn->downstream_mtu - overhead;
++	LeaveCriticalSection(&conn->lock);
++
++	return (max_pdu > 0) ? (size_t)max_pdu : 0;
++}
++
++int rdpeudp_conn_write(rdpRdpeudpConn* conn, const BYTE* data, size_t len)
++{
++	WINPR_ASSERT(conn);
++
++	if (conn->state != RDPEUDP_STATE_CONNECTED)
++		return -1;
++
++	int written = SSL_write(conn->dtls, data, (int)len);
++	rdpeudp_conn_flush_dtls_out(conn);
++	return written;
++}
++
++int rdpeudp_conn_read(rdpRdpeudpConn* conn, BYTE* data, size_t len)
++{
++	WINPR_ASSERT(conn);
++
++	if (conn->recv_msg_count == 0)
++	{
++		ResetEvent(conn->event);
++		return 0;
++	}
++
++	/* Dequeue one message */
++	UINT16 idx = conn->recv_msg_head;
++	UINT32 msg_len = conn->recv_msgs[idx].len;
++
++	/* Messages are discrete. Copying part of one and dropping the rest would
++	 * hand the channel layer a truncated PDU and then the next one, which is a
++	 * far more confusing failure than refusing. */
++	if (len < msg_len)
++	{
++		WLog_ERR(TAG, "Tunnel message of %u bytes does not fit in a %zu byte "
++		              "buffer; dropping it and continuing",
++		         msg_len, len);
++		free(conn->recv_msgs[idx].data);
++		conn->recv_msgs[idx].data = NULL;
++		conn->recv_msgs[idx].len = 0;
++		conn->recv_msg_head = (idx + 1) % 256;
++		conn->recv_msg_count--;
++		if (conn->recv_msg_count == 0)
++			ResetEvent(conn->event);
++		/* Zero, not an error: the caller drains while this returns positive, so
++		 * an error here would end the pass and leave the rest of the queue
++		 * sitting. One unusable message must not stop the others. */
++		return 0;
++	}
++
++	size_t to_copy = msg_len;
++	memcpy(data, conn->recv_msgs[idx].data, to_copy);
++	free(conn->recv_msgs[idx].data);
++	conn->recv_msgs[idx].data = NULL;
++	conn->recv_msgs[idx].len = 0;
++
++	conn->recv_msg_head = (idx + 1) % 256;
++	conn->recv_msg_count--;
++
++	if (conn->recv_msg_count == 0)
++		ResetEvent(conn->event);
++
++	return (int)to_copy;
++}
++
++/* ============================================================
++ * RDPEMT transport layer (MS-RDPEMT Data framing)
++ * ============================================================ */
++
++int rdpemt_conn_write(rdpRdpeudpConn* conn, const BYTE* data, size_t len)
++{
++	WINPR_ASSERT(conn);
++
++	if (len > 65535)
++		return -1;
++
++	/* Called from the peer thread, while the session's main context is driving
++	 * the same TLS object from the other side. */
++	EnterCriticalSection(&conn->lock);
++
++	if (!conn->tunnel_created || conn->state != RDPEUDP_STATE_CONNECTED)
++	{
++		LeaveCriticalSection(&conn->lock);
++		return -1;
++	}
++
++	/* Build RDPEMT Tunnel Data PDU:
++	 *   Action (1 byte) = 0x02 (RDPTUNNEL_ACTION_DATA)
++	 *   PayloadLength (2 bytes, LE)
++	 *   HeaderLength (1 byte) = 4
++	 *   Payload (RDP PDU data)
++	 */
++	size_t pdu_len = 4 + len;
++	BYTE* pdu = malloc(pdu_len);
++	if (!pdu)
++	{
++		LeaveCriticalSection(&conn->lock);
++		return -1;
++	}
++
++	pdu[0] = 0x02;  /* Action = RDPTUNNEL_ACTION_DATA */
++	pdu[1] = (BYTE)(len & 0xFF);
++	pdu[2] = (BYTE)((len >> 8) & 0xFF);
++	pdu[3] = 0x04;  /* HeaderLength = 4 (no subheaders) */
++	memcpy(pdu + 4, data, len);
++
++	rdpemt_trace_payload("TX", data, len);
++
++	int written = rdpeudp_conn_write(conn, pdu, pdu_len);
++	free(pdu);
++	LeaveCriticalSection(&conn->lock);
++
++	if (written < 4)
++		return -1;
++	return written - 4;
++}
++
++int rdpemt_conn_read(rdpRdpeudpConn* conn, BYTE* data, size_t len)
++{
++	/* rdpeudp_conn_read already returns RDPEMT-stripped payload
++	 * (the v1_data handler extracts payload at hdr_len offset for action=0x02) */
++	int n;
++
++	EnterCriticalSection(&conn->lock);
++	n = rdpeudp_conn_read(conn, data, len);
++	LeaveCriticalSection(&conn->lock);
++
++	if (n > 0)
++		rdpemt_trace_payload("RX", data, (size_t)n);
++
++	return n;
++}
++
++BOOL rdpeudp_conn_has_pending_data(rdpRdpeudpConn* conn)
++{
++	BOOL pending;
++
++	if (!conn)
++		return FALSE;
++
++	EnterCriticalSection(&conn->lock);
++	pending = conn->recv_msg_count > 0;
++	LeaveCriticalSection(&conn->lock);
++
++	return pending;
++}
++
++int rdpeudp_conn_get_fd(rdpRdpeudpConn* conn)
++{
++	WINPR_ASSERT(conn);
++	if (!conn->server)
++		return -1;
++	return conn->server->sockfd;
++}
++
++void rdpeudp_conn_free(rdpRdpeudpConn* conn)
++{
++	if (!conn)
++		return;
++
++	if (conn->dtls)
++	{
++		SSL_shutdown(conn->dtls);
++		SSL_free(conn->dtls);
++		/* BIOs are freed by SSL_free */
++	}
++
++	if (conn->event)
++		CloseHandle(conn->event);
++
++	DeleteCriticalSection(&conn->lock);
++
++	/* Free any queued recv messages */
++	while (conn->recv_msg_count > 0)
++	{
++		UINT16 idx = conn->recv_msg_head;
++		free(conn->recv_msgs[idx].data);
++		conn->recv_msgs[idx].data = NULL;
++		conn->recv_msg_head = (idx + 1) % 256;
++		conn->recv_msg_count--;
++	}
++
++	/* Remove from server's connection list */
++	if (conn->server)
++	{
++		for (int i = 0; i < conn->server->n_connections; i++)
++		{
++			if (conn->server->connections[i] == conn)
++			{
++				memmove(&conn->server->connections[i],
++				        &conn->server->connections[i+1],
++				        sizeof(rdpRdpeudpConn*) * (conn->server->n_connections - i - 1));
++				conn->server->n_connections--;
++				break;
++			}
++		}
++	}
++
++	free(conn);
++}
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/rdpeudp.h
+===================================================================
+--- /dev/null
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/rdpeudp.h
+@@ -0,0 +1,172 @@
++/**
++ * FreeRDP: A Remote Desktop Protocol Implementation
++ * MS-RDPEUDP - UDP Transport Extension
++ *
++ * Copyright 2026 Geoffrey
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef FREERDP_LIB_CORE_RDPEUDP_H
++#define FREERDP_LIB_CORE_RDPEUDP_H
++
++#include <freerdp/api.h>
++#include <winpr/stream.h>
++#include <winpr/synch.h>
++
++/* ============================================================
++ * MS-RDPEUDP protocol constants (section 2.2)
++ * ============================================================ */
++
++/* RDPUDP_FLAG values (v1 header uFlags, big-endian on wire).
++ * Derived from mstsc SYN analysis: flags=0x1801 = SYN|SYNEX|CORRELATIONID.
++ */
++#define RDPUDP_FLAG_SYN            0x0001
++#define RDPUDP_FLAG_FIN            0x0002
++#define RDPUDP_FLAG_ACK            0x0004
++#define RDPUDP_FLAG_DATA           0x0008
++#define RDPUDP_FLAG_FEC            0x0010
++#define RDPUDP_FLAG_CN             0x0020
++#define RDPUDP_FLAG_CWR            0x0040
++/*
++ * From 0x0080 up these were named one position out of step. The numbers the
++ * code uses were right -- the one place that matters skips the
++ * ACK_OF_ACKS payload on 0x0100, which is correct -- but the names were not,
++ * and mstsc sends 0x0404 on a DATA/ACK packet, which reads as ACK|ACKDELAYED
++ * and not as ACK|SYNLOSSY. Anyone reaching for a name would have got the
++ * wrong bit.
++ */
++#define RDPUDP_FLAG_SACK_OPTION    0x0080
++#define RDPUDP_FLAG_ACKOFACKS      0x0100
++#define RDPUDP_FLAG_SYNLOSSY       0x0200
++#define RDPUDP_FLAG_ACKDELAYED     0x0400
++#define RDPUDP_FLAG_CORRELATIONID  0x0800
++#define RDPUDP_FLAG_SYNEX          0x1000
++
++/* RDPEUDP version values (section 2.2.2.5) */
++/*
++ * MS-RDPEUDP 2.2.2.5. Version 3 is the one that carries the RDPEUDP2 packet
++ * format; versions 1 and 2 use the original header. Naming 0x0101 "version 2"
++ * made a client offering 0x0002 negotiate down to version 1, where nothing is
++ * implemented, and the connection went quiet after the handshake.
++ */
++#define RDPUDP_VERSION_1           0x0001
++#define RDPUDP_VERSION_2           0x0002
++#define RDPUDP_VERSION_3           0x0101
++
++/* RDPEUDP2 packet type flags (section 2.2.3) */
++#define RDPEUDP2_ACK               0x0001
++#define RDPEUDP2_OVERSIZE          0x0002
++#define RDPEUDP2_DATA              0x0004
++#define RDPEUDP2_ACKVEC            0x0008
++
++/* Default MTU values */
++#define RDPEUDP_MTU_DEFAULT        1232
++
++/* Connection state */
++typedef enum
++{
++	RDPEUDP_STATE_CLOSED = 0,
++	RDPEUDP_STATE_SYN_RECEIVED,    /* server got SYN, sent SYN-ACK */
++	RDPEUDP_STATE_ESTABLISHED,     /* 3-way handshake complete */
++	RDPEUDP_STATE_DTLS_HANDSHAKE,  /* DTLS handshake in progress */
++	RDPEUDP_STATE_CONNECTED,       /* DTLS established, data can flow */
++	RDPEUDP_STATE_FIN_SENT
++} RdpeudpState;
++
++/* Forward declarations */
++#include <freerdp/rdpeudp.h>
++
++/* ============================================================
++ * Callback: invoked when a UDP connection is fully established
++ * (DTLS handshake complete). The application can then route
++ * data over the UDP channel.
++ * ============================================================ */
++
++
++/*
++ * Whether the client has sent application data over this connection.
++ *
++ * The handshake only proves the client can reach us; it says nothing about our
++ * datagrams reaching the client. Until traffic has come back the path is
++ * unproven, and the graphics channel must stay on TCP -- routing it onto a path
++ * that turns out to be one-way loses the session's picture entirely.
++ */
++FREERDP_LOCAL BOOL rdpeudp_conn_path_confirmed(rdpRdpeudpConn* conn);
++
++/* ============================================================
++ * Server: manages the single UDP socket and demultiplexes
++ * incoming datagrams to per-client connections.
++ * ============================================================ */
++
++FREERDP_API rdpRdpeudpServer* rdpeudp_server_new(int port);
++FREERDP_API void rdpeudp_server_free(rdpRdpeudpServer* server);
++
++/* Get the UDP socket fd for event polling */
++FREERDP_API int rdpeudp_server_get_fd(rdpRdpeudpServer* server);
++
++/* Process incoming UDP datagrams (call when socket is readable) */
++FREERDP_API int rdpeudp_server_check_fds(rdpRdpeudpServer* server);
++
++/* Register a pending connection with a security cookie.
++ * When a SYN arrives matching this cookie, a new rdpRdpeudpConn is created. */
++FREERDP_API rdpRdpeudpConn* rdpeudp_server_register_cookie(
++    rdpRdpeudpServer* server,
++    const BYTE cookie[16],
++    RdpeudpConnectedCb callback,
++    void* userdata);
++
++/* Set TLS credentials for DTLS (must match TCP TLS cert per MS-RDPEMT) */
++FREERDP_API BOOL rdpeudp_server_set_tls_credentials(
++    rdpRdpeudpServer* server,
++    const char* cert_pem,
++    const char* key_pem);
++
++/* ============================================================
++ * Connection: per-client UDP session
++ * ============================================================ */
++
++FREERDP_API RdpeudpState rdpeudp_conn_get_state(rdpRdpeudpConn* conn);
++
++/* Get the event handle for this connection (signaled when data available) */
++FREERDP_API HANDLE rdpeudp_conn_get_event(rdpRdpeudpConn* conn);
++
++/* Get max DVC PDU size that fits in a single v1 UDP packet within MTU */
++FREERDP_API size_t rdpeudp_conn_get_max_pdu(rdpRdpeudpConn* conn);
++
++/* Send data over the DTLS-secured UDP channel */
++FREERDP_API int rdpeudp_conn_write(rdpRdpeudpConn* conn, const BYTE* data, size_t len);
++
++/* Receive data from the DTLS-secured UDP channel */
++FREERDP_API int rdpeudp_conn_read(rdpRdpeudpConn* conn, BYTE* data, size_t len);
++
++FREERDP_API void rdpeudp_conn_free(rdpRdpeudpConn* conn);
++
++/* ============================================================
++ * RDPEMT transport layer: wraps rdpeudp_conn with MS-RDPEMT
++ * Data framing (action=0x00 Tunnel Data PDU).
++ * Provides a BIO for use with rdpTransport.
++ * ============================================================ */
++
++/* Write an RDP PDU via RDPEMT Data framing over the UDP tunnel.
++ * Returns bytes of payload written (excluding RDPEMT header), or < 0 on error. */
++FREERDP_API int rdpemt_conn_write(rdpRdpeudpConn* conn, const BYTE* data, size_t len);
++
++/* Read an RDP PDU from the UDP tunnel (RDPEMT header already stripped).
++ * Returns bytes read, 0 if no data, or < 0 on error. */
++FREERDP_API int rdpemt_conn_read(rdpRdpeudpConn* conn, BYTE* data, size_t len);
++
++/* Get the UDP socket fd (for integrating into an external event loop) */
++FREERDP_API int rdpeudp_conn_get_fd(rdpRdpeudpConn* conn);
++
++#endif /* FREERDP_LIB_CORE_RDPEUDP_H */
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/server.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/server.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/server.c
+@@ -41,6 +41,7 @@
+ #include <freerdp/utils/drdynvc.h>
+ 
+ #include "rdp.h"
++#include "rdpeudp.h"
+ 
+ #include "server.h"
+ 
+@@ -55,6 +56,12 @@
+ #endif
+ 
+ #define DVC_MAX_DATA_PDU_SIZE 1600
++/*
++ * The smallest buffer a dynamic-channel PDU can be built in: one command byte
++ * plus a channel id and a length, each up to four bytes, and room to carry
++ * something. Anything less and the header alone overruns the allocation.
++ */
++#define DVC_MIN_DATA_PDU_SIZE 64
+ 
+ typedef struct
+ {
+@@ -156,12 +163,15 @@ static BOOL wts_read_drdynvc_capabilitie
+ 
+ 	WINPR_ASSERT(channel);
+ 	WINPR_ASSERT(channel->vcm);
++	DEBUG_DVC("DYNVC_CAPS_RESPONSE received (length=%" PRIu32 ")", length);
+ 	if (length < 3)
+ 		return FALSE;
+ 
+ 	Stream_Seek_UINT8(channel->receiveData); /* Pad (1 byte) */
+ 	Stream_Read_UINT16(channel->receiveData, Version);
+-	DEBUG_DVC("Version: %" PRIu16 "", Version);
++	WLog_INFO(TAG, "DYNVC_CAPS_RESPONSE: client Version=%" PRIu16 " (length=%" PRIu32 ")",
++	          Version, length);
++	DEBUG_DVC("DYNVC_CAPS_RESPONSE: client Version=%" PRIu16, Version);
+ 
+ 	if (Version < 1)
+ 	{
+@@ -194,11 +204,15 @@ static BOOL wts_read_drdynvc_create_resp
+ 	{
+ 		DEBUG_DVC("ChannelId %" PRIu32 " creation failed (%" PRId32 ")", channel->channelId,
+ 		          (INT32)CreationStatus);
++		WLog_WARN(TAG, "DVC ChannelId %" PRIu32 " creation FAILED (status=0x%08" PRIX32 ")",
++		          channel->channelId, CreationStatus);
+ 		channel->dvc_open_state = DVC_OPEN_STATE_FAILED;
+ 	}
+ 	else
+ 	{
+ 		DEBUG_DVC("ChannelId %" PRIu32 " creation succeeded", channel->channelId);
++		WLog_INFO(TAG, "DVC ChannelId %" PRIu32 " creation succeeded (name=%s)",
++		          channel->channelId, channel->channelName ? channel->channelName : "?");
+ 		channel->dvc_open_state = DVC_OPEN_STATE_SUCCEEDED;
+ 	}
+ 
+@@ -302,6 +316,9 @@ static BOOL wts_read_drdynvc_pdu(rdpPeer
+ 	Sp = (value & 0x0c) >> 2;
+ 	cbChId = (value & 0x03) >> 0;
+ 
++	WLog_INFO(TAG, "wts_read_drdynvc_pdu: Cmd=0x%02X Sp=%u cbChId=%u length=%" PRIuz,
++	          Cmd, Sp, cbChId, length);
++
+ 	if (Cmd == CAPABILITY_REQUEST_PDU)
+ 		return wts_read_drdynvc_capabilities_response(channel, (UINT32)length);
+ 
+@@ -376,10 +393,20 @@ static BOOL wts_read_drdynvc_pdu(rdpPeer
+ 				break;
+ 
+ 			case SOFT_SYNC_RESPONSE_PDU:
+-				WLog_ERR(TAG, "SoftSync response not handled yet(and rather strange to receive "
+-				              "that packet as our code doesn't send SoftSync requests");
++			{
++				WLog_INFO(TAG, "Received Soft-Sync Response from client");
++				/* Activate Soft-Sync state but defer UDP routing until the
++				 * UDP path is confirmed working (first UDP data received).
++				 * This ensures critical RDPGFX init commands go via TCP. */
++				rdpRdp* rdpCtx = channel->vcm->rdp;
++				if (rdpCtx)
++				{
++					rdpCtx->udpSoftSyncDone = TRUE;
++					rdpCtx->udpActivatedTimeMs = GetTickCount64();
++					WLog_INFO(TAG, "Soft-Sync Response received; UDP routing deferred until path confirmed");
++				}
+ 				break;
+-
++			}
+ 			case SOFT_SYNC_REQUEST_PDU:
+ 				WLog_ERR(TAG, "Not expecting a SoftSyncRequest on the server");
+ 				return FALSE;
+@@ -461,41 +488,13 @@ static BOOL WTSProcessChannelData(rdpPee
+ 
+ 	if (channel->channelFlags & CHANNEL_OPTION_SHOW_PROTOCOL)
+ 	{
+-		BOOL firstPass = TRUE;
+-
+-		while (size)
+-		{
+-			const UINT32 payloadLen = (size > CHANNEL_CHUNK_LENGTH)
+-			                              ? CHANNEL_CHUNK_LENGTH
+-			                              : WINPR_ASSERTING_INT_CAST(UINT32, size);
+-			size -= payloadLen;
+-
+-			/* here we skip other flags than CHANNEL_FLAG_FIRST and CHANNEL_FLAG_LAST
+-			 * as it's the only ones treated by ChannelPduTracker.
+-			 */
+-			UINT32 newFlags = 0;
+-			if (firstPass)
+-			{
+-				firstPass = FALSE;
+-				if (flags & CHANNEL_FLAG_FIRST)
+-					newFlags = CHANNEL_FLAG_FIRST;
+-			}
++		const CHANNEL_PDU_HEADER header = {
++			.length = WINPR_ASSERTING_INT_CAST(UINT32, size),
++			.flags = flags,
++		};
+ 
+-			if (!size && (flags & CHANNEL_FLAG_LAST))
+-				newFlags |= CHANNEL_FLAG_LAST;
+-
+-			const CHANNEL_PDU_HEADER header = {
+-				.length = payloadLen,
+-				.flags = newFlags,
+-			};
+-
+-			if (!wts_queue_receive_data(channel, (const BYTE*)&header, sizeof(header), data,
+-			                            payloadLen))
+-				return FALSE;
+-
+-			data += payloadLen;
+-		}
+-		return TRUE;
++		return wts_queue_receive_data(channel, (const BYTE*)&header, sizeof(header), data,
++		                              header.length);
+ 	}
+ 
+ 	if ((flags & CHANNEL_FLAG_FIRST) != 0)
+@@ -616,7 +615,8 @@ BOOL WTSVirtualChannelManagerOpen(HANDLE
+ 
+ 		if (channel)
+ 		{
+-			BYTE capaBuffer[12] = WINPR_C_ARRAY_INIT;
++			/* 2 + 2 + four PriorityCharge fields; version 3 writes all of them. */
++			BYTE capaBuffer[20] = WINPR_C_ARRAY_INIT;
+ 			wStream staticS = WINPR_C_ARRAY_INIT;
+ 			wStream* s = Stream_StaticInit(&staticS, capaBuffer, sizeof(capaBuffer));
+ 
+@@ -624,9 +624,12 @@ BOOL WTSVirtualChannelManagerOpen(HANDLE
+ 			vcm->dvc_spoken_version = 1;
+ 			Stream_Write_UINT8(s, 0x50);    /* Cmd=5 sp=0 cbId=0 */
+ 			Stream_Write_UINT8(s, 0x00);    /* Pad */
+-			Stream_Write_UINT16(s, 0x0001); /* Version */
+-
+-			/* TODO: shall implement version 2 and 3 */
++			Stream_Write_UINT16(s, 0x0003); /* Version 3 (Soft-Sync support) */
++			/* PriorityCharge0..3 required for Version >= 2 (MS-RDPEDYC 2.2.2.1) */
++			Stream_Write_UINT32(s, 0);      /* PriorityCharge0 */
++			Stream_Write_UINT32(s, 0);      /* PriorityCharge1 */
++			Stream_Write_UINT32(s, 0);      /* PriorityCharge2 */
++			Stream_Write_UINT32(s, 0);      /* PriorityCharge3 */
+ 
+ 			const size_t pos = Stream_GetPosition(s);
+ 			WINPR_ASSERT(pos <= UINT32_MAX);
+@@ -656,6 +659,45 @@ BOOL WTSVirtualChannelManagerCheckFileDe
+ 			return FALSE;
+ 	}
+ 
++	/*
++	 * Collect what arrived on the tunnel, here, because this is the thread that
++	 * owns the channel manager.
++	 *
++	 * The session's main context reads the socket and drives TLS -- that half
++	 * is serialised by the connection's own lock -- but the dynamic-channel
++	 * state machine is driven from here, and parsing tunnel PDUs on the other
++	 * thread meant two threads walking the channel table and dispatching to
++	 * channel listeners at once. The queue between them is the handover point;
++	 * everything above it stays on one thread.
++	 */
++	{
++		rdpRdp* udpRdp = vcm->rdp;
++
++		if (udpRdp && udpRdp->udpConn)
++		{
++			/* Heap, not 64 KB of the socket thread's stack. Note the explicit
++			 * size: sizeof() on the pointer would be eight. */
++			const size_t tunnelDataSize = 65536;
++			BYTE* tunnelData = malloc(tunnelDataSize);
++			int n_read;
++
++			if (!tunnelData)
++				return FALSE;
++
++
++			while ((n_read = rdpemt_conn_read(udpRdp->udpConn, tunnelData,
++			                                  tunnelDataSize)) > 0)
++			{
++				if (!WTSVirtualChannelManagerProcessUdpData(hServer, tunnelData,
++				                                            (size_t)n_read))
++					WLog_DBG(TAG, "Could not process %d bytes from the tunnel",
++					         n_read);
++			}
++
++			free(tunnelData);
++		}
++	}
++
+ 	while (MessageQueue_Peek(vcm->queue, &message, TRUE))
+ 	{
+ 		BYTE* buffer = nullptr;
+@@ -665,6 +707,81 @@ BOOL WTSVirtualChannelManagerCheckFileDe
+ 		buffer = (BYTE*)message.wParam;
+ 		length = (UINT32)(UINT_PTR)message.lParam;
+ 
++		/* Route DRDYNVC data PDUs via RDPEMT/UDP after Soft-Sync.
++		 * The RDPEMT HigherLayerData is the raw DRDYNVC PDU (no MCS/TPKT wrapping).
++		 * Control PDUs (CAPS, CREATE, CLOSE, SOFT_SYNC) always stay on TCP.
++		 * The Soft-Sync Request itself is sent on TCP; once it leaves the queue
++		 * we set udpSoftSyncDone so every subsequent DATA goes via UDP. */
++		if (vcm->drdynvc_channel && channelId == (UINT16)vcm->drdynvc_channel->channelId &&
++		    length > 0)
++		{
++			rdpRdp* rdp = vcm->rdp;
++			UINT8 cmd = (buffer[0] & 0xF0) >> 4;
++
++			WLog_DBG(TAG, "Dequeue DRDYNVC: cmd=0x%02X len=%" PRIu32
++			              " softSyncDone=%d udpConn=%d pathConfirmed=%d",
++			         cmd, length, rdp ? rdp->udpSoftSyncDone : -1,
++			         (rdp && rdp->udpConn) ? 1 : 0,
++			         (rdp && rdp->udpConn) ? rdpeudp_conn_path_confirmed(rdp->udpConn) : -1);
++
++			/* After Soft-Sync Request has been sent on TCP, route DATA via UDP */
++			if (rdp && rdp->udpSoftSyncDone && rdp->udpConn &&
++			    rdpeudp_conn_path_confirmed(rdp->udpConn))
++			{
++				if (cmd == DATA_FIRST_PDU || cmd == DATA_PDU ||
++				    cmd == DATA_FIRST_COMPRESSED_PDU || cmd == DATA_COMPRESSED_PDU)
++				{
++					/*
++					 * Anything the tunnel will take goes over it.
++					 *
++					 * This used to insist the whole RDPEMT PDU fit in one v1
++					 * packet, on the grounds that clients may not handle UDP
++					 * fragmentation. Nothing is being fragmented: what is
++					 * underneath is TLS over a reliable, sequenced byte stream,
++					 * and the flush loop cuts it into MTU-sized datagrams that
++					 * the far side puts back together before parsing. The rule
++					 * only ever excluded graphics, which is all of the traffic
++					 * worth moving -- a surface command is tens of kilobytes and
++					 * never fit, so every session stayed on TCP.
++					 */
++					if (length <= 65535)
++					{
++						int ret = rdpemt_conn_write(rdp->udpConn, buffer, length);
++						if (ret > 0)
++						{
++							WLog_DBG(TAG, "Routed DRDYNVC DATA via UDP (%d bytes)", ret);
++							free(buffer);
++							continue;
++						}
++						WLog_WARN(TAG, "RDPEMT write failed (ret=%d), falling back to TCP", ret);
++					}
++					else
++					{
++						WLog_DBG(TAG, "DVC PDU of %" PRIu32 " bytes is beyond what a "
++						              "tunnel PDU can carry, using TCP", length);
++					}
++				}
++			}
++
++			/* Detect when the Soft-Sync Request PDU leaves the queue → enable UDP routing */
++			if (cmd == SOFT_SYNC_REQUEST_PDU && rdp)
++			{
++				/* Send the Soft-Sync on TCP.
++				 * UDP routing is NOT activated yet — we must wait for the
++				 * Soft-Sync Response so the client has time to set up its
++				 * UDP channel mapping first. */
++				WINPR_ASSERT(vcm->client);
++				WINPR_ASSERT(vcm->client->SendChannelData);
++				if (!vcm->client->SendChannelData(vcm->client, channelId, buffer, length))
++					status = FALSE;
++				free(buffer);
++				if (!status)
++					break;
++				WLog_INFO(TAG, "Soft-Sync Request sent on TCP, waiting for Response before UDP routing");
++				continue;
++			}
++		}
++
+ 		WINPR_ASSERT(vcm->client);
+ 		WINPR_ASSERT(vcm->client->SendChannelData);
+ 		if (!vcm->client->SendChannelData(vcm->client, channelId, buffer, length))
+@@ -763,6 +880,151 @@ BYTE WTSVirtualChannelManagerGetDrdynvcS
+ 	return vcm->drdynvc_state;
+ }
+ 
++UINT16 WTSVirtualChannelManagerGetDvcSpokenVersion(HANDLE hServer)
++{
++	WTSVirtualChannelManager* vcm = (WTSVirtualChannelManager*)hServer;
++	WINPR_ASSERT(vcm);
++	return vcm->dvc_spoken_version;
++}
++
++BOOL WTSVirtualChannelManagerSendSoftSyncRequest(HANDLE hServer, UINT32 tunnelType)
++{
++	WTSVirtualChannelManager* vcm = (WTSVirtualChannelManager*)hServer;
++	WINPR_ASSERT(vcm);
++
++	if (!vcm->drdynvc_channel || vcm->drdynvc_state != DRDYNVC_STATE_READY)
++		return FALSE;
++
++	if (vcm->dvc_spoken_version < 3)
++	{
++		WLog_WARN(TAG, "DVC version %" PRIu16 " < 3, Soft-Sync not supported", vcm->dvc_spoken_version);
++		return FALSE;
++	}
++
++	/* Collect DVC channel IDs that are confirmed open (CREATE_RESPONSE received) */
++	UINT32 dvcIds[256];
++	UINT32 numDvcs = 0;
++	UINT32 totalDvcs = 0;
++	UINT32 resolvedDvcs = 0;
++
++	if (vcm->dynamicVirtualChannels)
++	{
++		size_t count = 0;
++		ULONG_PTR* keys = NULL;
++		count = HashTable_GetKeys(vcm->dynamicVirtualChannels, &keys);
++		totalDvcs = (UINT32)count;
++		for (size_t i = 0; i < count && numDvcs < 256; i++)
++		{
++			/* keys[i] is a pointer to channel->channelId (UINT32*), dereference it */
++			const UINT32* pId = (const UINT32*)(void*)keys[i];
++			rdpPeerChannel* ch = wts_get_dvc_channel_by_id(vcm, *pId);
++			if (ch && ch->dvc_open_state != DVC_OPEN_STATE_NONE)
++			{
++				resolvedDvcs++;
++				if (ch->dvc_open_state == DVC_OPEN_STATE_SUCCEEDED)
++					dvcIds[numDvcs++] = *pId;
++			}
++		}
++		free(keys);
++	}
++
++	if (numDvcs == 0 || resolvedDvcs < totalDvcs)
++	{
++		WLog_DBG(TAG, "Soft-Sync deferred: %" PRIu32 " open, %" PRIu32 " resolved / %" PRIu32 " total DVC channels",
++		         numDvcs, resolvedDvcs, totalDvcs);
++		return FALSE;
++	}
++
++	/* Build DYNVC_SOFT_SYNC_REQUEST PDU:
++	 *   Byte 0:  [Cmd=0x08 (4 bits high)] [Sp=0 (2 bits)] [cbId=0 (2 bits)] = 0x80
++	 *   Byte 1:  Pad = 0x00
++	 *   Bytes 2-5: Length (4 bytes LE) = size of Flags + channel list
++	 *   Bytes 6-7: Flags (2 bytes LE) = SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT
++	 *   Bytes 8-9: NumberOfTunnels (2 bytes LE) = 1
++	 *   Bytes 10-13: TunnelType (4 bytes LE)
++	 *   Bytes 14-15: NumberOfDVCs (2 bytes LE)
++	 *   For each DVC: DvcId (4 bytes LE)
++	 */
++	/* Four bytes per DVC id, not two. The client reads the list that way: in
++	 * mstscax's CDynVCPlugin::ValidateSoftSyncPDU it walks the tunnels with
++	 *
++	 *   next = offset + NumberOfDVCs * 4          (bounds check against cbPayload)
++	 *   offset = next + 6                          (TunnelType + NumberOfDVCs)
++	 *
++	 * so a list written two bytes wide makes the request describe less data than
++	 * the client computes, the bounds check fails, and the PDU is dropped without
++	 * a Soft-Sync Response -- the tunnel comes up and then nothing moves onto it. */
++	size_t channelListSize = 4 + 2 + (numDvcs * 4); /* TunnelType + NumDVCs + DvcIds */
++	size_t flagsAndListSize = 2 + 2 + channelListSize; /* Flags + NumTunnels + channelList */
++	size_t pduSize = 2 + 4 + flagsAndListSize; /* Header(2) + Length(4) + rest */
++
++	BYTE pduBuf[1024];
++	if (pduSize > sizeof(pduBuf))
++		return FALSE;
++
++	wStream staticS = { 0 };
++	wStream* s = Stream_StaticInit(&staticS, pduBuf, sizeof(pduBuf));
++
++	Stream_Write_UINT8(s, 0x80); /* Cmd=SOFT_SYNC_REQUEST(0x08) Sp=0 cbId=0 */
++	Stream_Write_UINT8(s, 0x00); /* Pad */
++	/* Length counts everything after the two-byte header -- the field itself,
++	 * the flags, the tunnel count and the channel list. The client checks it
++	 * against the payload it was handed, which is the PDU minus that header,
++	 * and rejects anything larger; the total length of the PDU is one greater
++	 * than it will accept. */
++	Stream_Write_UINT32(s, (UINT32)(pduSize - 2)); /* Length */
++	Stream_Write_UINT16(s, SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT); /* Flags */
++	Stream_Write_UINT16(s, 1);  /* NumberOfTunnels */
++	Stream_Write_UINT32(s, tunnelType); /* TunnelType */
++	Stream_Write_UINT16(s, (UINT16)numDvcs); /* NumberOfDVCs */
++
++	for (UINT32 i = 0; i < numDvcs; i++)
++		Stream_Write_UINT32(s, dvcIds[i]); /* DvcId */
++
++	size_t pos = Stream_GetPosition(s);
++	ULONG written = 0;
++
++	WLog_INFO(TAG, "Sending Soft-Sync Request (tunnel=0x%08" PRIX32 ", %"
++	          PRIu32 " DVCs, %" PRIuz " bytes)", tunnelType, numDvcs, pos);
++	/* Hex dump of the PDU for debugging */
++	{
++		char hex[1024] = { 0 };
++		size_t off = 0;
++		for (size_t i = 0; i < pos && off + 3 < sizeof(hex); i++)
++			off += snprintf(hex + off, sizeof(hex) - off, "%02X ", pduBuf[i]);
++		WLog_INFO(TAG, "Soft-Sync Request hex: %s", hex);
++		for (UINT32 i = 0; i < numDvcs; i++)
++			WLog_INFO(TAG, "  DVC[%u] channelId=%" PRIu32, i, dvcIds[i]);
++	}
++
++	return WTSVirtualChannelWrite(vcm->drdynvc_channel, (PCHAR)pduBuf, (UINT32)pos, &written);
++}
++
++BOOL WTSVirtualChannelManagerProcessUdpData(HANDLE hServer, const BYTE* data, size_t len)
++{
++	WTSVirtualChannelManager* vcm = (WTSVirtualChannelManager*)hServer;
++	WINPR_ASSERT(vcm);
++
++	if (!vcm->drdynvc_channel || vcm->drdynvc_state != DRDYNVC_STATE_READY)
++		return FALSE;
++
++	if (!data || len == 0 || len > UINT32_MAX)
++		return FALSE;
++
++	rdpPeerChannel* channel = vcm->drdynvc_channel;
++
++	/* Write the raw DVC PDU into the drdynvc channel's receive stream
++	 * and process it exactly as if it arrived on TCP. */
++	Stream_SetPosition(channel->receiveData, 0);
++	if (!Stream_EnsureRemainingCapacity(channel->receiveData, len))
++		return FALSE;
++
++	Stream_Write(channel->receiveData, data, len);
++	BOOL ret = wts_read_drdynvc_pdu(channel);
++	Stream_SetPosition(channel->receiveData, 0);
++	return ret;
++}
++
+ void WTSVirtualChannelManagerSetDVCCreationCallback(HANDLE hServer, psDVCCreationStatusCallback cb,
+                                                     void* userdata)
+ {
+@@ -1757,10 +2019,29 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelWri
+ 	{
+ 		first = TRUE;
+ 
++		/* With the UDP transport in use, a dynamic channel PDU has to fit in one
++		 * RDP-UDP packet within the negotiated MTU; the default chunk is larger
++		 * than that and would be split by a layer that does not reassemble. */
++		UINT32 maxPduSize = DVC_MAX_DATA_PDU_SIZE;
++		if (channel->vcm->rdp && channel->vcm->rdp->udpConn)
++		{
++			const size_t udpMax = rdpeudp_conn_get_max_pdu(channel->vcm->rdp->udpConn);
++
++			/*
++			 * The floor matters: this sizes a heap buffer that the dynamic
++			 * channel header is written into before anything checks capacity,
++			 * and the value derives from an MTU the peer named in an
++			 * unauthenticated SYN. The transport clamps it too; this is the
++			 * second lock on the same door, because the overflow is here.
++			 */
++			if (udpMax > DVC_MIN_DATA_PDU_SIZE && udpMax < maxPduSize)
++				maxPduSize = (UINT32)udpMax;
++		}
++
+ 		size_t Length = uLength;
+ 		while (Length > 0)
+ 		{
+-			s = Stream_New(nullptr, DVC_MAX_DATA_PDU_SIZE);
++			s = Stream_New(nullptr, maxPduSize);
+ 
+ 			if (!s)
+ 			{
+Index: freerdp3-3.30.0+dfsg/libfreerdp/core/transport.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/core/transport.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/core/transport.c
+@@ -803,7 +803,12 @@ static void transport_bio_error_log(rdpT
+ 	WINPR_ASSERT(transport);
+ 
+ 	saveerrno = errno;
+-	level = WLOG_ERROR;
++
++	/* Broken pipe (EPIPE) during disconnect is expected, downgrade to WARN */
++	if (saveerrno == EPIPE || saveerrno == ECONNRESET)
++		level = WLOG_WARN;
++	else
++		level = WLOG_ERROR;
+ 
+ 	if (!WLog_IsLevelActive(transport->log, level))
+ 		return;
+Index: freerdp3-3.30.0+dfsg/libfreerdp/crypto/tls.c
+===================================================================
+--- freerdp3-3.30.0+dfsg.orig/libfreerdp/crypto/tls.c
++++ freerdp3-3.30.0+dfsg/libfreerdp/crypto/tls.c
+@@ -949,7 +949,10 @@ TlsHandshakeResult freerdp_tls_handshake
+ 		if (!BIO_should_retry(tls->bio))
+ 		{
+ 			wLog* log = WLog_Get(TAG);
+-			WLog_Print(log, WLOG_ERROR, "BIO_do_handshake failed");
++			const int ssl_error = SSL_get_error(tls->ssl, (int)status);
++			WLog_Print(log, WLOG_ERROR,
++			           "BIO_do_handshake failed (SSL_get_error: %d, errno: %d [%s])",
++			           ssl_error, errno, strerror(errno));
+ 			ERR_print_errors_cb(bio_err_print, log);
+ 			return TLS_HANDSHAKE_ERROR;
+ 		}

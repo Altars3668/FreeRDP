@@ -1,0 +1,75 @@
+From 40d9202cd95551600c07437ce6bd5ecd7d31e57b Mon Sep 17 00:00:00 2001
+From: David Fort <contact@hardening-consulting.com>
+Date: Mon, 27 Jul 2026 16:01:36 +0200
+Subject: [PATCH] Fix for #13102
+
+This patch fixes the case where packet channels are bigger than 1600 bytes and used
+by the channel PDU tracker. In theory WTSVirtualChannelRead can not read more than
+CHANNEL_CHUNK_LENGTH bytes, so if we receive something bigger we must post multiple
+chunks with the appropriate flag simulating that the big packet has been sent in
+multiple chunks.
+---
+ libfreerdp/core/server.c | 42 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/libfreerdp/core/server.c b/libfreerdp/core/server.c
+index a46be5c7809f..fab79e736b58 100644
+--- a/libfreerdp/core/server.c
++++ b/libfreerdp/core/server.c
+@@ -452,7 +452,7 @@ static BOOL WTSProcessChannelData(rdpPeerChannel* channel, UINT16 channelId, con
+                                   size_t s, UINT32 flags, size_t t)
+ {
+ 	BOOL ret = TRUE;
+-	const size_t size = s;
++	size_t size = s;
+ 	const size_t totalSize = t;
+ 
+ 	WINPR_ASSERT(channel);
+@@ -461,13 +461,41 @@ static BOOL WTSProcessChannelData(rdpPeerChannel* channel, UINT16 channelId, con
+ 
+ 	if (channel->channelFlags & CHANNEL_OPTION_SHOW_PROTOCOL)
+ 	{
+-		const CHANNEL_PDU_HEADER header = {
+-			.length = WINPR_ASSERTING_INT_CAST(UINT32, size),
+-			.flags = flags,
+-		};
++		BOOL firstPass = TRUE;
+ 
+-		return wts_queue_receive_data(channel, (const BYTE*)&header, sizeof(header), data,
+-		                              header.length);
++		while (size)
++		{
++			const UINT32 payloadLen = (size > CHANNEL_CHUNK_LENGTH)
++			                              ? CHANNEL_CHUNK_LENGTH
++			                              : WINPR_ASSERTING_INT_CAST(UINT32, size);
++			size -= payloadLen;
++
++			/* here we skip other flags than CHANNEL_FLAG_FIRST and CHANNEL_FLAG_LAST
++			 * as it's the only ones treated by ChannelPduTracker.
++			 */
++			UINT32 newFlags = 0;
++			if (firstPass)
++			{
++				firstPass = FALSE;
++				if (flags & CHANNEL_FLAG_FIRST)
++					newFlags = CHANNEL_FLAG_FIRST;
++			}
++
++			if (!size && (flags & CHANNEL_FLAG_LAST))
++				newFlags |= CHANNEL_FLAG_LAST;
++
++			const CHANNEL_PDU_HEADER header = {
++				.length = payloadLen,
++				.flags = newFlags,
++			};
++
++			if (!wts_queue_receive_data(channel, (const BYTE*)&header, sizeof(header), data,
++			                            payloadLen))
++				return FALSE;
++
++			data += payloadLen;
++		}
++		return TRUE;
+ 	}
+ 
+ 	if ((flags & CHANNEL_FLAG_FIRST) != 0)
